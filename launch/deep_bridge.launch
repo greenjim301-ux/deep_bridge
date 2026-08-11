@@ -1,0 +1,4 @@
+<launch>
+    <rosparam file="$(find deep_bridge)/config/deep_bridge.yaml" command="load" ns="deep_bridge_node"/>
+    <node pkg="deep_bridge" type="deep_bridge_node" name="deep_bridge_node" output="screen"/>
+</launch>

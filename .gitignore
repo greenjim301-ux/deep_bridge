@@ -1,0 +1,7 @@
+# Build
+build/
+devel/
+install/
+*.pyc
+*~
+.DS_Store
