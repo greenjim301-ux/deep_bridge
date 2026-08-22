@@ -213,7 +213,7 @@ void CmdVelBridge::handleAsdu(const std::string& asdu_json) {
 }
 
 void CmdVelBridge::handleBasicStatus(const nlohmann::json& items) {
-    ROS_INFO("[deep_bridge] received BasicStatus ASDU: %s", items.dump().c_str());
+    // ROS_INFO("[deep_bridge] received BasicStatus ASDU: %s", items.dump().c_str());
     
     if (!items.contains("BasicStatus")) {
         ROS_WARN_THROTTLE(5.0, "[deep_bridge] dropped BasicStatus ASDU without BasicStatus field at %s:%d", __FILE__, __LINE__);
