@@ -187,7 +187,7 @@ void CmdVelBridge::handleAsdu(const std::string& asdu_json) {
 
         type = pd["Type"].get<int>();
         command = pd["Command"].get<int>();
-        items = pd.at("Items").get<nlohmann::json::object>();
+        items = pd.at("Items").get<nlohmann::json>();
     } catch (const std::exception& e) {
         ROS_WARN_THROTTLE(5.0, "[deep_bridge] failed to read ASDU fields at %s:%d: %s | body=%s", __FILE__, __LINE__,
                            e.what(), root.dump().c_str());
