@@ -168,21 +168,31 @@ void CmdVelBridge::handleAsdu(const std::string& asdu_json) {
     try {
         root = nlohmann::json::parse(asdu_json);
     } catch (const std::exception& e) {
-        ROS_WARN_THROTTLE(5.0, "[deep_bridge] failed to parse ASDU JSON: %s", e.what());
+        ROS_WARN_THROTTLE(5.0, "[deep_bridge] failed to parse ASDU JSON at %s:%d: %s | body=%s", __FILE__, __LINE__,
+                           e.what(), asdu_json.c_str());
         return;
     }
 
-    if (!root.contains("PatrolDevice")) {
-        return;
-    }
-    const auto& pd = root["PatrolDevice"];
-    if (!pd.contains("Type") || !pd.contains("Command")) {
-        return;
-    }
+    int type = 0;
+    int command = 0;
+    nlohmann::json items = nlohmann::json::object();
+    try {
+        if (!root.contains("PatrolDevice")) {
+            return;
+        }
+        const auto& pd = root["PatrolDevice"];
+        if (!pd.contains("Type") || !pd.contains("Command")) {
+            return;
+        }
 
-    const int type = pd["Type"].get<int>();
-    const int command = pd["Command"].get<int>();
-    const auto items = pd.value("Items", nlohmann::json::object());
+        type = pd["Type"].get<int>();
+        command = pd["Command"].get<int>();
+        items = pd.value("Items", nlohmann::json::object());
+    } catch (const std::exception& e) {
+        ROS_WARN_THROTTLE(5.0, "[deep_bridge] failed to read ASDU fields at %s:%d: %s | body=%s", __FILE__, __LINE__,
+                           e.what(), root.dump().c_str());
+        return;
+    }
 
     // 目前只处理这个桥接节点安全运行需要的两类上报：基础状态（控制闸门/启动回读）
     // 和异常状态（日志可见性）。设备状态(1002/5)、运控状态(1002/4)、导航相关消息
@@ -201,11 +211,17 @@ void CmdVelBridge::handleBasicStatus(const nlohmann::json& items) {
     const auto& bs = items["BasicStatus"];
 
     BasicStatus status;
-    status.motion_state = bs.value("MotionState", -1);
-    status.gait = bs.value("Gait", -1);
-    status.hes = bs.value("HES", -1);
-    status.control_usage_mode = bs.value("ControlUsageMode", -1);
-    status.sleep = bs.value("Sleep", false);
+    try {
+        status.motion_state = bs.value("MotionState", -1);
+        status.gait = bs.value("Gait", -1);
+        status.hes = bs.value("HES", -1);
+        status.control_usage_mode = bs.value("ControlUsageMode", -1);
+        status.sleep = bs.value("Sleep", false);
+    } catch (const std::exception& e) {
+        ROS_WARN_THROTTLE(5.0, "[deep_bridge] failed to read BasicStatus fields at %s:%d: %s | body=%s", __FILE__,
+                           __LINE__, e.what(), bs.dump().c_str());
+        return;
+    }
     status.valid = true;
     status.stamp = ros::Time::now();
 
@@ -222,8 +238,16 @@ void CmdVelBridge::handleAbnormalStatus(const nlohmann::json& items) {
         return;
     }
     for (const auto& err : errors) {
-        const int code = err.value("errorCode", 0);
-        const int component = err.value("component", 0);
+        int code = 0;
+        int component = 0;
+        try {
+            code = err.value("errorCode", 0);
+            component = err.value("component", 0);
+        } catch (const std::exception& e) {
+            ROS_WARN_THROTTLE(5.0, "[deep_bridge] failed to read ErrorList entry at %s:%d: %s | body=%s", __FILE__,
+                               __LINE__, e.what(), err.dump().c_str());
+            continue;
+        }
         ROS_WARN_THROTTLE(2.0, "[deep_bridge] robot reported error 0x%04X on component bitmask 0x%X", code,
                            component);
     }
