@@ -16,12 +16,12 @@
 namespace deep_bridge {
 
 namespace {
-double Normalize(double v, double max_v) {
-    // max_v<=0 是配置错误（分母为零），当成"没有配置限速"处理，输出 0 而不是 inf/nan
+double Clamp(double v, double max_v) {
+    // max_v<=0 是配置错误，当成"没有配置限速"处理，输出 0 而不是原值
     if (max_v <= 1e-6) {
         return 0.0;
     }
-    return std::max(-1.0, std::min(1.0, v / max_v));
+    return std::max(-max_v, std::min(max_v, v));
 }
 
 std::string NowLocalTimeString() {
@@ -46,7 +46,6 @@ CmdVelBridge::CmdVelBridge(ros::NodeHandle& nh, ros::NodeHandle& pnh) {
     pnh.param("max_vy", max_vy_, max_vy_);
     pnh.param("max_vyaw", max_vyaw_, max_vyaw_);
     pnh.param("auto_stand_on_start", auto_stand_on_start_, auto_stand_on_start_);
-    pnh.param("motion_state_on_start", motion_state_on_start_, motion_state_on_start_);
     pnh.param("stand_settle_sec", stand_settle_sec_, stand_settle_sec_);
     pnh.param("gait_on_start", gait_on_start_, gait_on_start_);
     pnh.param("mode_settle_sec", mode_settle_sec_, mode_settle_sec_);
@@ -59,10 +58,11 @@ CmdVelBridge::CmdVelBridge(ros::NodeHandle& nh, ros::NodeHandle& pnh) {
     recv_thread_ = std::thread(&CmdVelBridge::receiveLoop, this);
 
     // 心跳必须最先起来：机器人只向持续发心跳的 IP:端口上报状态（手册 1.3 节），
-    // 下面所有启动步骤的回读确认都靠这份持续上报，没有心跳就永远等不到状态
-    heartbeat_timer_ =
-        nh.createTimer(ros::Duration(1.0 / heartbeat_rate_hz_), &CmdVelBridge::heartbeatTimerCallback, this);
-    heartbeatTimerCallback(ros::TimerEvent());  // 立即发一帧，不等第一个定时器周期
+    // 下面所有启动步骤的回读确认都靠这份持续上报，没有心跳就永远等不到状态。
+    // 用独立线程而不是 ros::Timer，是因为下面 applyUsageMode/autoStandOnStart 等启动步骤
+    // 全是阻塞调用，此时 main.cpp 里的 ros::spin() 还没开始跑，ros::Timer 不会自己触发，
+    // 只发一次心跳撑不了整个启动阶段（机器人这边没有持续收到心跳就会停止上报状态）。
+    heartbeat_thread_ = std::thread(&CmdVelBridge::heartbeatLoop, this);
 
     if (set_usage_mode_on_start_) {
         applyUsageMode();
@@ -75,7 +75,7 @@ CmdVelBridge::CmdVelBridge(ros::NodeHandle& nh, ros::NodeHandle& pnh) {
     }
     logFinalStatus();
 
-    // 启动流程走完之后才建订阅者/控制定时器，确保切换过程中不会有轴指令跟状态切换请求打架
+    // 启动流程走完之后才建订阅者/控制定时器，确保切换过程中不会有速度指令跟状态切换请求打架
     cmd_vel_sub_ = nh.subscribe(cmd_vel_topic_, 1, &CmdVelBridge::cmdVelCallback, this);
     control_timer_ =
         nh.createTimer(ros::Duration(1.0 / control_rate_hz_), &CmdVelBridge::controlTimerCallback, this);
@@ -89,14 +89,17 @@ CmdVelBridge::CmdVelBridge(ros::NodeHandle& nh, ros::NodeHandle& pnh) {
 }
 
 CmdVelBridge::~CmdVelBridge() {
-    // 节点退出前主动发一次全零轴指令，不完全依赖控制超时看门狗
+    // 节点退出前主动发一次全零速度指令，不完全依赖控制超时看门狗
     if (sock_fd_ >= 0) {
-        sendAxisCommand(0.0, 0.0, 0.0);
+        sendSpeedCommand(0.0, 0.0, 0.0);
     }
 
     running_ = false;
     if (recv_thread_.joinable()) {
         recv_thread_.join();
+    }
+    if (heartbeat_thread_.joinable()) {
+        heartbeat_thread_.join();
     }
     if (sock_fd_ >= 0) {
         ::close(sock_fd_);
@@ -317,42 +320,45 @@ bool CmdVelBridge::sendRequest(int type, int command, const nlohmann::json& item
     return true;
 }
 
-void CmdVelBridge::sendAxisCommand(double x, double y, double yaw, double z, double roll, double pitch) {
+void CmdVelBridge::sendSpeedCommand(double x, double y, double yaw, double z, double roll, double pitch) {
     const nlohmann::json items = {{"X", x}, {"Y", y}, {"Z", z}, {"Roll", roll}, {"Pitch", pitch}, {"Yaw", yaw}};
-    sendRequest(2, 21, items);  // Type=2 Command=21：运动控制（轴指令），手册 1.2.5
+    // Type=2 Command=25：运动控制-速度指令（basic_server 协议 4.5，仅导航模式下可使用）。
+    // 与 Cmd=21 字段格式相同，但 X/Y/Z/Roll/Pitch/Yaw 传的是实际速度值（m/s、rad/s）；
+    // 当前开放的四种移动步态仅有 X、Y、Yaw 三个参数项生效，Z/Roll/Pitch 填 0。
+    sendRequest(2, 25, items);
 }
 
 void CmdVelBridge::applyUsageMode() {
     BasicStatus status;
     if (!waitForFreshBasicStatus(status_wait_timeout_sec_, status)) {
         ROS_WARN("[deep_bridge] timed out waiting for initial status report; sending usage-mode switch anyway");
-    } else if (status.control_usage_mode == 0) {
-        ROS_INFO("[deep_bridge] already in normal usage mode, skip switch");
+    } else if (status.control_usage_mode == 1) {
+        ROS_INFO("[deep_bridge] already in navigation usage mode, skip switch");
         return;
     }
 
-    ROS_INFO("[deep_bridge] switching to normal usage mode (Mode=0) ...");
-    sendRequest(1101, 5, {{"Mode", 0}});  // Type=1101 Command=5：使用模式切换，手册 1.2.2
+    ROS_INFO("[deep_bridge] switching to navigation usage mode (Mode=1) ...");
+    sendRequest(1101, 5, {{"Mode", 1}});  // Type=1101 Command=5：使用模式切换；Mode：0常规 1导航 2辅助
     if (mode_settle_sec_ > 0.0) {
         ros::Duration(mode_settle_sec_).sleep();
     }
 
-    if (waitForFreshBasicStatus(status_wait_timeout_sec_, status) && status.control_usage_mode != 0) {
-        ROS_WARN("[deep_bridge] usage mode readback mismatch after switch: got %d, expected 0 (normal). Axis "
-                 "commands (1.2.5) only take effect in normal mode.",
+    if (waitForFreshBasicStatus(status_wait_timeout_sec_, status) && status.control_usage_mode != 1) {
+        ROS_WARN("[deep_bridge] usage mode readback mismatch after switch: got %d, expected 1 (navigation). Speed "
+                 "commands (2/25) only take effect in navigation mode.",
                  status.control_usage_mode);
     }
 }
 
 void CmdVelBridge::autoStandOnStart() {
     ROS_WARN("[deep_bridge] auto_stand_on_start=true: make sure the robot has clear space before it stands up");
-    ROS_INFO("[deep_bridge] requesting motion state %d ...", motion_state_on_start_);
+    ROS_INFO("[deep_bridge] requesting stand (MotionParam=1) ...");
 
-    // 手册 1.2.3 的状态机图：从开机阻尼/空闲/趴下等任意状态直接请求目标运动状态
-    // （比如 6=标准运动模式），机器人会自己走完中间的"正在起立状态"，不需要
-    // 分两步先请求 1=站立 再单独请求运动模式——跟 unitree_bridge 里
-    // RecoveryStand() 对起始姿态没有要求是同样的思路，所以这里只发一次请求。
-    sendRequest(2, 22, {{"MotionParam", motion_state_on_start_}});  // Type=2 Command=22：运动状态转换，手册 1.2.3
+    // basic_server 协议 4.2：运动状态转换（Cmd=22）可下发的 MotionParam 只有
+    // 1=站立 / 2=软急停 / 4=趴下。站立(1) 是临时过渡状态，机器人会自动跳转到
+    // RL 控制(17)——唯一可执行移动控制和步态切换的状态，所以这里只发站立指令，
+    // 再用 BasicStatus(MotionState) 回读确认是否已经进入 17（协议 6 节快速启动流程）。
+    sendRequest(2, 22, {{"MotionParam", 1}});  // Type=2 Command=22：运动状态转换，协议 4.2
 
     if (stand_settle_sec_ > 0.0) {
         ROS_INFO_STREAM("[deep_bridge] waiting " << stand_settle_sec_ << "s for stand-up to physically settle...");
@@ -360,21 +366,28 @@ void CmdVelBridge::autoStandOnStart() {
     }
 
     BasicStatus status;
-    if (!waitForFreshBasicStatus(status_wait_timeout_sec_, status)) {
-        ROS_WARN("[deep_bridge] timed out waiting for status readback after stand request");
-        return;
+    const ros::Time deadline = ros::Time::now() + ros::Duration(status_wait_timeout_sec_);
+    bool in_rl_control = false;
+    while (ros::ok() && ros::Time::now() < deadline) {
+        const double remaining = (deadline - ros::Time::now()).toSec();
+        if (waitForFreshBasicStatus(std::max(0.0, remaining), status) && status.motion_state == 17) {
+            in_rl_control = true;
+            break;
+        }
     }
-    if (status.motion_state != motion_state_on_start_) {
-        ROS_WARN("[deep_bridge] motion state readback mismatch: got %d, requested %d", status.motion_state,
-                  motion_state_on_start_);
+    if (!in_rl_control) {
+        ROS_WARN("[deep_bridge] timed out waiting for RL control state (17) after stand request (last motion_state=%d)",
+                  status.motion_state);
     } else {
-        ROS_INFO("[deep_bridge] motion state confirmed: %d", status.motion_state);
+        ROS_INFO("[deep_bridge] motion state confirmed: RL control (17)");
     }
 }
 
 void CmdVelBridge::applyGaitOnStart() {
-    ROS_INFO("[deep_bridge] requesting gait %d ...", gait_on_start_);
-    sendRequest(2, 23, {{"GaitParam", gait_on_start_}});  // Type=2 Command=23：步态切换，手册 1.2.4
+    ROS_INFO("[deep_bridge] requesting gait 0x%04X (%d) ...", gait_on_start_, gait_on_start_);
+    // Type=2 Command=23：步态切换（basic_server 协议 4.3）。
+    // 仅在 RL 控制状态(17)且机器人静止时有效，所以必须等起立完成进入 17 之后再切。
+    sendRequest(2, 23, {{"GaitParam", gait_on_start_}});
     if (mode_settle_sec_ > 0.0) {
         ros::Duration(mode_settle_sec_).sleep();
     }
@@ -406,8 +419,20 @@ void CmdVelBridge::cmdVelCallback(const geometry_msgs::Twist::ConstPtr& msg) {
     have_cmd_ = true;
 }
 
-void CmdVelBridge::heartbeatTimerCallback(const ros::TimerEvent&) {
-    sendRequest(100, 100, nlohmann::json::object());  // Type=100 Command=100：心跳指令，手册 1.2.1
+void CmdVelBridge::heartbeatLoop() {
+    const double period_sec = heartbeat_rate_hz_ > 1e-6 ? 1.0 / heartbeat_rate_hz_ : 1.0;
+    constexpr double kPollStep = 0.05;  // 小步 sleep，保证 running_=false 后能及时退出
+
+    while (running_.load()) {
+        sendRequest(100, 100, nlohmann::json::object());  // Type=100 Command=100：心跳指令，手册 1.2.1
+
+        double waited = 0.0;
+        while (running_.load() && waited < period_sec) {
+            const double step = std::min(kPollStep, period_sec - waited);
+            ros::Duration(step).sleep();
+            waited += step;
+        }
+    }
 }
 
 void CmdVelBridge::controlTimerCallback(const ros::TimerEvent&) {
@@ -429,28 +454,30 @@ void CmdVelBridge::controlTimerCallback(const ros::TimerEvent&) {
         status = last_basic_status_;
     }
 
-    // 安全闸门：还没收到过状态上报 / 硬急停触发 / 不在常规模式 / 运动状态不是
-    // 可行走的 RL 控制态（6 标准 / 8 敏捷）时，一律发全零轴指令，不管 cmd_vel
+    // 安全闸门：还没收到过状态上报 / 硬急停触发 / 不在导航模式 / 运动状态不是
+    // 可行走的 RL 控制态（17）时，一律发全零速度指令，不管 cmd_vel
     // 是否还在正常到达——跟 unitree_bridge 的 cmd_timeout 看门狗同样的思路，
     // 只是这里多了几条闸门条件，因为 M20 的"能不能走"不只取决于有没有新指令。
-    const bool safe_to_drive = status.valid && status.hes == 0 && status.control_usage_mode == 0 &&
-                                (status.motion_state == 6 || status.motion_state == 8);
+    const bool safe_to_drive =
+        status.valid && status.hes == 0 && status.control_usage_mode == 1 && status.motion_state == 17;
 
     if (timed_out || !safe_to_drive) {
         if (!safe_to_drive) {
             ROS_WARN_THROTTLE(5.0,
                                "[deep_bridge] not safe to drive (valid=%d HES=%d control_usage_mode=%d "
-                               "motion_state=%d), sending zero axis command",
+                               "motion_state=%d), sending zero speed command",
                                status.valid, status.hes, status.control_usage_mode, status.motion_state);
         }
-        sendAxisCommand(0.0, 0.0, 0.0);
+        sendSpeedCommand(0.0, 0.0, 0.0);
         return;
     }
 
-    const double x = Normalize(vx, max_vx_);
-    const double y = Normalize(vy, max_vy_);
-    const double yaw = Normalize(vyaw, max_vyaw_);
-    sendAxisCommand(x, y, yaw);
+    // Cmd=25 传的是实际速度值（m/s、rad/s），直接下发 cmd_vel 并夹到配置的上限。
+    // 参考协议 4.5 的步态有效速度范围（如 0x3002 平地/敏捷：X ±2.0 m/s、Y ±1.0 m/s、Yaw ±1.5 rad/s）。
+    const double x = Clamp(vx, max_vx_);
+    const double y = Clamp(vy, max_vy_);
+    const double yaw = Clamp(vyaw, max_vyaw_);
+    sendSpeedCommand(x, y, yaw);
 }
 
 }  // namespace deep_bridge
