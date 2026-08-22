@@ -216,7 +216,7 @@ void CmdVelBridge::handleBasicStatus(const nlohmann::json& items) {
         status.gait = bs.value("Gait", -1);
         status.hes = bs.value("HES", -1);
         status.control_usage_mode = bs.value("ControlUsageMode", -1);
-        status.sleep = bs.value("Sleep", false);
+        status.sleep = bs.value("Sleep", -1);
     } catch (const std::exception& e) {
         ROS_WARN_THROTTLE(5.0, "[deep_bridge] failed to read BasicStatus fields at %s:%d: %s | body=%s", __FILE__,
                            __LINE__, e.what(), bs.dump().c_str());
