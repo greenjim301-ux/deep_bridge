@@ -187,7 +187,7 @@ void CmdVelBridge::handleAsdu(const std::string& asdu_json) {
 
         type = pd["Type"].get<int>();
         command = pd["Command"].get<int>();
-        items = pd.value("Items", nlohmann::json::object());
+        items = pd.at("Items").get<nlohmann::json::object>();
     } catch (const std::exception& e) {
         ROS_WARN_THROTTLE(5.0, "[deep_bridge] failed to read ASDU fields at %s:%d: %s | body=%s", __FILE__, __LINE__,
                            e.what(), root.dump().c_str());
@@ -212,11 +212,11 @@ void CmdVelBridge::handleBasicStatus(const nlohmann::json& items) {
 
     BasicStatus status;
     try {
-        status.motion_state = bs.value("MotionState", -1);
-        status.gait = bs.value("Gait", -1);
-        status.hes = bs.value("HES", -1);
-        status.control_usage_mode = bs.value("ControlUsageMode", -1);
-        status.sleep = bs.value("Sleep", -1);
+        status.motion_state = bs.at("MotionState").get<int>();
+        status.gait = bs.at("Gait").get<int>();
+        status.hes = bs.at("HES").get<int>();
+        status.control_usage_mode = bs.at("ControlUsageMode").get<int>();
+        status.sleep = bs.at("Sleep").get<int>();
     } catch (const std::exception& e) {
         ROS_WARN_THROTTLE(5.0, "[deep_bridge] failed to read BasicStatus fields at %s:%d: %s | body=%s", __FILE__,
                            __LINE__, e.what(), bs.dump().c_str());
@@ -241,8 +241,8 @@ void CmdVelBridge::handleAbnormalStatus(const nlohmann::json& items) {
         int code = 0;
         int component = 0;
         try {
-            code = err.value("errorCode", 0);
-            component = err.value("component", 0);
+            code = err.at("errorCode").get<int>();
+            component = err.at("component").get<int>();
         } catch (const std::exception& e) {
             ROS_WARN_THROTTLE(5.0, "[deep_bridge] failed to read ErrorList entry at %s:%d: %s | body=%s", __FILE__,
                                __LINE__, e.what(), err.dump().c_str());
