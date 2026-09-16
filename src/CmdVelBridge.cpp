@@ -1,15 +1,9 @@
 #include "deep_bridge/CmdVelBridge.h"
 
 #include <algorithm>
-#include <cerrno>
 #include <cstring>
 #include <ctime>
 #include <stdexcept>
-
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
 
 #include "deep_bridge/UdpProtocol.h"
 
@@ -25,7 +19,7 @@ double Clamp(double v, double max_v) {
 }
 
 std::string NowLocalTimeString() {
-    // 手册 1.1.6：Time 字段格式 YYYY-MM-DD HH:MM:SS，本地时区
+    // 指南 1.1.6：Time 字段格式 YYYY-MM-DD HH:MM:SS，本地时区
     const std::time_t now = std::time(nullptr);
     std::tm local_tm{};
     localtime_r(&now, &local_tm);
@@ -38,6 +32,9 @@ std::string NowLocalTimeString() {
 CmdVelBridge::CmdVelBridge(ros::NodeHandle& nh, ros::NodeHandle& pnh) {
     pnh.param("server_ip", server_ip_, server_ip_);
     pnh.param("server_port", server_port_, server_port_);
+    pnh.param("use_dtls", use_dtls_, use_dtls_);
+    pnh.param("ca_file", ca_file_, ca_file_);
+    pnh.param("dtls_handshake_timeout_sec", dtls_handshake_timeout_sec_, dtls_handshake_timeout_sec_);
     pnh.param("cmd_vel_topic", cmd_vel_topic_, cmd_vel_topic_);
     pnh.param("control_rate_hz", control_rate_hz_, control_rate_hz_);
     pnh.param("cmd_timeout_sec", cmd_timeout_sec_, cmd_timeout_sec_);
@@ -52,12 +49,12 @@ CmdVelBridge::CmdVelBridge(ros::NodeHandle& nh, ros::NodeHandle& pnh) {
     pnh.param("set_usage_mode_on_start", set_usage_mode_on_start_, set_usage_mode_on_start_);
     pnh.param("status_wait_timeout_sec", status_wait_timeout_sec_, status_wait_timeout_sec_);
 
-    openSocket();
+    openTransport();
 
     running_ = true;
     recv_thread_ = std::thread(&CmdVelBridge::receiveLoop, this);
 
-    // 心跳必须最先起来：机器人只向持续发心跳的 IP:端口上报状态（手册 1.3 节），
+    // 心跳必须最先起来：机器人只向持续发心跳的 IP:端口上报状态（指南 1.3 节），
     // 下面所有启动步骤的回读确认都靠这份持续上报，没有心跳就永远等不到状态。
     // 用独立线程而不是 ros::Timer，是因为下面 applyUsageMode/autoStandOnStart 等启动步骤
     // 全是阻塞调用，此时 main.cpp 里的 ros::spin() 还没开始跑，ros::Timer 不会自己触发，
@@ -81,6 +78,7 @@ CmdVelBridge::CmdVelBridge(ros::NodeHandle& nh, ros::NodeHandle& pnh) {
         nh.createTimer(ros::Duration(1.0 / control_rate_hz_), &CmdVelBridge::controlTimerCallback, this);
 
     ROS_INFO_STREAM("[deep_bridge] server=" << server_ip_ << ":" << server_port_
+                                             << (use_dtls_ ? " (DTLS)" : " (plain UDP)")
                                              << " cmd_vel_topic=" << cmd_vel_topic_
                                              << " control_rate_hz=" << control_rate_hz_
                                              << " cmd_timeout_sec=" << cmd_timeout_sec_ << " max_vx=" << max_vx_
@@ -90,7 +88,7 @@ CmdVelBridge::CmdVelBridge(ros::NodeHandle& nh, ros::NodeHandle& pnh) {
 
 CmdVelBridge::~CmdVelBridge() {
     // 节点退出前主动发一次全零速度指令，不完全依赖控制超时看门狗
-    if (sock_fd_ >= 0) {
+    if (transport_) {
         sendSpeedCommand(0.0, 0.0, 0.0);
     }
 
@@ -101,56 +99,28 @@ CmdVelBridge::~CmdVelBridge() {
     if (heartbeat_thread_.joinable()) {
         heartbeat_thread_.join();
     }
-    if (sock_fd_ >= 0) {
-        ::close(sock_fd_);
-        sock_fd_ = -1;
-    }
+    // 收发线程都停了才拆连接，否则 DTLS 的 SSL 对象会在别的线程用着的时候被释放
+    transport_.reset();
 }
 
-void CmdVelBridge::openSocket() {
-    sock_fd_ = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock_fd_ < 0) {
-        throw std::runtime_error(std::string("deep_bridge: socket() failed: ") + std::strerror(errno));
-    }
-
-    // 接收超时给后台线程的阻塞 recv() 一个上限，配合 running_ 标志实现可中断的接收循环，
-    // 避免用另一个线程 close() 同一个 fd 来"打断" recv() 这种依赖平台细节的做法
-    struct timeval tv {};
-    tv.tv_sec = 0;
-    tv.tv_usec = 200000;  // 200ms
-    ::setsockopt(sock_fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-    struct sockaddr_in server_addr {};
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(static_cast<uint16_t>(server_port_));
-    if (::inet_pton(AF_INET, server_ip_.c_str(), &server_addr.sin_addr) <= 0) {
-        ::close(sock_fd_);
-        sock_fd_ = -1;
-        throw std::runtime_error("deep_bridge: invalid server_ip: " + server_ip_);
-    }
-
-    // connect() 一个 UDP 套接字只是把目的地址固定下来，之后可以用 send()/recv()，
-    // 内核也会丢弃来自其它地址的数据包——机器人只有一个地址，天然适合这么用
-    if (::connect(sock_fd_, reinterpret_cast<struct sockaddr*>(&server_addr), sizeof(server_addr)) < 0) {
-        ::close(sock_fd_);
-        sock_fd_ = -1;
-        throw std::runtime_error(std::string("deep_bridge: connect() failed: ") + std::strerror(errno));
-    }
+void CmdVelBridge::openTransport() {
+    UdpTransport::Options options;
+    options.server_ip = server_ip_;
+    options.server_port = server_port_;
+    options.use_dtls = use_dtls_;
+    options.ca_file = ca_file_;
+    options.handshake_timeout_sec = dtls_handshake_timeout_sec_;
+    transport_.reset(new UdpTransport(options));
 }
 
 void CmdVelBridge::receiveLoop() {
     std::vector<uint8_t> buf(8192);
     while (running_.load()) {
-        const ssize_t n = ::recv(sock_fd_, buf.data(), buf.size(), 0);
-        if (n < 0) {
-            // 超时（EAGAIN/EWOULDBLOCK）是正常的轮询节奏；其它错误打个警告但不退出循环，
-            // 避免网络短暂抖动就把接收线程整个结束掉
-            if (errno != EAGAIN && errno != EWOULDBLOCK && running_.load()) {
-                ROS_WARN_THROTTLE(5.0, "[deep_bridge] recv() error: %s", std::strerror(errno));
-            }
-            continue;
-        }
-        if (n == 0) {
+        // 0.2s 超时给这个循环一个可中断的节奏，配合 running_ 标志退出
+        const ssize_t n = transport_->receive(buf.data(), buf.size(), 0.2);
+        if (n <= 0) {
+            // 0=超时，是正常的轮询节奏；<0 由 UdpTransport 自己打日志。两种都不退出
+            // 循环，避免网络短暂抖动就把接收线程整个结束掉。
             continue;
         }
 
@@ -200,16 +170,40 @@ void CmdVelBridge::handleAsdu(const std::string& asdu_json) {
         return;
     }
 
-    // 目前只处理这个桥接节点安全运行需要的两类上报：基础状态（控制闸门/启动回读）
-    // 和异常状态（日志可见性）。设备状态(1002/5)、运控状态(1002/4)、导航相关消息
-    // 手册里都有定义，暂不需要，按需在这里加分支即可。
-    if (type == 1002 && command == 6) {
+    // 目前只处理这个桥接节点安全运行需要的三类报文：基础状态（控制闸门/启动回读）、
+    // 异常状态（日志可见性），以及指南 1.5 的通用接口调用状态响应（请求是否被接受）。
+    // 运控状态(1.3.1.2)、设备状态(1.3.1.3)、巡检类(1.4)指南里都有定义，暂不需要，
+    // 按需在这里加分支即可。
+    if (type == protocol::msg::kTypeBasicStatus && command == protocol::msg::kCmdStatusReport) {
         handleBasicStatus(items);
-    } else if (type == 1002 && command == 3) {
+    } else if (type == protocol::msg::kTypeAbnormalStatus && command == protocol::msg::kCmdStatusReport) {
         handleAbnormalStatus(items);
+    } else if (items.contains("ErrorCode")) {
+        // 指南 1.5：通用响应的 Type/Command 与请求原样相同，没有自己的专用取值，
+        // 只能靠 Items 里的 ErrorCode 认出来。
+        handleGenericResponse(type, command, items);
     } else {
-        ROS_DEBUG_THROTTLE(10.0, "[deep_bridge] dropped ASDU Type=%d Command=%d", type, command);
+        ROS_DEBUG_THROTTLE(10.0, "[deep_bridge] dropped ASDU Type=0x%08X Command=0x%08X", type, command);
     }
+}
+
+void CmdVelBridge::handleGenericResponse(int type, int command, const nlohmann::json& items) {
+    int error_code = 0;
+    std::string error_message;
+    try {
+        error_code = items.at("ErrorCode").get<int>();
+        error_message = items.value("ErrorMessage", std::string());
+    } catch (const std::exception& e) {
+        ROS_WARN_THROTTLE(5.0, "[deep_bridge] failed to read generic response at %s:%d: %s | body=%s", __FILE__,
+                           __LINE__, e.what(), items.dump().c_str());
+        return;
+    }
+
+    if (error_code == 0) {
+        return;  // 成功的响应每条速度指令都会回一条，20Hz 下不能逐条打日志
+    }
+    ROS_WARN_THROTTLE(2.0, "[deep_bridge] request Type=0x%08X Command=0x%08X rejected: ErrorCode=0x%04X (%s)", type,
+                       command, error_code, error_message.c_str());
 }
 
 void CmdVelBridge::handleBasicStatus(const nlohmann::json& items) {
@@ -223,11 +217,15 @@ void CmdVelBridge::handleBasicStatus(const nlohmann::json& items) {
 
     BasicStatus status;
     try {
+        // 这四个是安全闸门的依据，缺一不可
         status.motion_state = bs.at("MotionState").get<int>();
         status.gait = bs.at("Gait").get<int>();
         status.hes = bs.at("HES").get<int>();
         status.control_usage_mode = bs.at("ControlUsageMode").get<int>();
-        status.sleep = bs.at("Sleep").get<int>();
+        // Sleep 只用于日志。指南 1.3.1.1 写的是 bool，老固件上是 int，两种都收——
+        // 为一个纯展示字段的类型差异丢掉整份状态，会让安全闸门一直关着、机器人不动。
+        const auto& sleep_field = bs.at("Sleep");
+        status.sleep = sleep_field.is_boolean() ? sleep_field.get<bool>() : sleep_field.get<int>() != 0;
     } catch (const std::exception& e) {
         ROS_WARN_THROTTLE(5.0, "[deep_bridge] failed to read BasicStatus fields at %s:%d: %s | body=%s", __FILE__,
                            __LINE__, e.what(), bs.dump().c_str());
@@ -252,17 +250,42 @@ void CmdVelBridge::handleAbnormalStatus(const nlohmann::json& items) {
     }
     for (const auto& err : errors) {
         int code = 0;
-        int component = 0;
+        int event_type = 0;
+        std::string name;
+        std::string resources;
+        int severity = 0;
         try {
-            code = err.at("errorCode").get<int>();
-            component = err.at("component").get<int>();
+            // 指南 1.3.1.4：Code 故障编码，Name 故障名，Type 1=发生/等级变化 2=已消除，
+            // Resources/Severities 是等长数组，逐个部件给出位置和严重等级(3 WARN/4 ERROR/5 FATAL)
+            code = err.at("Code").get<int>();
+            event_type = err.at("Type").get<int>();
+            name = err.value("Name", std::string());
+            if (err.contains("Severities")) {
+                for (const auto& s : err["Severities"]) {
+                    severity = std::max(severity, s.get<int>());
+                }
+            }
+            if (err.contains("Resources")) {
+                for (const auto& r : err["Resources"]) {
+                    if (!resources.empty()) {
+                        resources += ",";
+                    }
+                    resources += r.is_string() ? r.get<std::string>() : r.dump();
+                }
+            }
         } catch (const std::exception& e) {
             ROS_WARN_THROTTLE(5.0, "[deep_bridge] failed to read ErrorList entry at %s:%d: %s | body=%s", __FILE__,
                                __LINE__, e.what(), err.dump().c_str());
             continue;
         }
-        ROS_WARN_THROTTLE(2.0, "[deep_bridge] robot reported error 0x%04X on component bitmask 0x%X", code,
-                           component);
+
+        if (event_type == 2) {
+            ROS_INFO_THROTTLE(2.0, "[deep_bridge] robot error cleared: 0x%04X %s [%s]", code, name.c_str(),
+                               resources.c_str());
+        } else {
+            ROS_WARN_THROTTLE(2.0, "[deep_bridge] robot reported error 0x%04X %s severity=%d parts=[%s]", code,
+                               name.c_str(), severity, resources.c_str());
+        }
     }
 }
 
@@ -290,12 +313,12 @@ bool CmdVelBridge::waitForFreshBasicStatus(double timeout_sec, BasicStatus& out)
 uint16_t CmdVelBridge::nextMsgId() {
     std::lock_guard<std::mutex> lock(msg_id_mutex_);
     const uint16_t id = next_msg_id_;
-    ++next_msg_id_;  // uint16_t 自然溢出回绕到 0，正好符合手册 1.1.5 的要求
+    ++next_msg_id_;  // uint16_t 自然溢出回绕到 0，正好符合指南 1.1.5 的要求
     return id;
 }
 
 bool CmdVelBridge::sendRequest(int type, int command, const nlohmann::json& items) {
-    if (sock_fd_ < 0) {
+    if (!transport_) {
         return false;
     }
 
@@ -306,15 +329,13 @@ bool CmdVelBridge::sendRequest(int type, int command, const nlohmann::json& item
     const std::string asdu_str = asdu.dump();
     const std::vector<uint8_t> packet = protocol::encodeApdu(nextMsgId(), asdu_str);
     if (packet.empty()) {
-        ROS_WARN("[deep_bridge] ASDU too large to encode for Type=%d Command=%d (%zu bytes)", type, command,
+        ROS_WARN("[deep_bridge] ASDU too large to encode for Type=0x%08X Command=0x%08X (%zu bytes)", type, command,
                   asdu_str.size());
         return false;
     }
 
-    const ssize_t sent = ::send(sock_fd_, packet.data(), packet.size(), 0);
-    if (sent < 0 || static_cast<size_t>(sent) != packet.size()) {
-        ROS_WARN_THROTTLE(5.0, "[deep_bridge] send() failed for Type=%d Command=%d: %s", type, command,
-                           std::strerror(errno));
+    if (!transport_->send(packet.data(), packet.size())) {
+        ROS_WARN_THROTTLE(5.0, "[deep_bridge] send failed for Type=0x%08X Command=0x%08X", type, command);
         return false;
     }
     return true;
@@ -322,10 +343,11 @@ bool CmdVelBridge::sendRequest(int type, int command, const nlohmann::json& item
 
 void CmdVelBridge::sendSpeedCommand(double x, double y, double yaw, double z, double roll, double pitch) {
     const nlohmann::json items = {{"X", x}, {"Y", y}, {"Z", z}, {"Roll", roll}, {"Pitch", pitch}, {"Yaw", yaw}};
-    // Type=2 Command=25：运动控制-速度指令（basic_server 协议 4.5，仅导航模式下可使用）。
-    // 与 Cmd=21 字段格式相同，但 X/Y/Z/Roll/Pitch/Yaw 传的是实际速度值（m/s、rad/s）；
-    // 当前开放的四种移动步态仅有 X、Y、Yaw 三个参数项生效，Z/Roll/Pitch 填 0。
-    sendRequest(2, 25, items);
+    // 指南 1.2.6 真实轴指令：字段与 1.2.5 轴指令相同，区别是这里传的是实际速度值
+    // （X/Y/Z 为 m/s，Roll/Pitch/Yaw 为 rad/s，不做归一化、不再额外限速），且仅在导航
+    // 模式下生效——正好对上 cmd_vel 的语义，所以用它而不是 1.2.5 的 [-1,1] 归一化轴指令
+    // （那个只在常规/辅助模式下执行）。基础步态只响应 X、Y、Yaw，Z/Roll/Pitch 填 0。
+    sendRequest(protocol::msg::kTypeMotion, protocol::msg::kCmdAxisReal, items);
 }
 
 void CmdVelBridge::applyUsageMode() {
@@ -338,14 +360,15 @@ void CmdVelBridge::applyUsageMode() {
     }
 
     ROS_INFO("[deep_bridge] switching to navigation usage mode (Mode=1) ...");
-    sendRequest(1101, 5, {{"Mode", 1}});  // Type=1101 Command=5：使用模式切换；Mode：0常规 1导航 2辅助
+    // 指南 1.2.2 使用模式切换；Mode：0 常规 / 1 导航 / 2 辅助
+    sendRequest(protocol::msg::kTypeUsageMode, protocol::msg::kCmdUsageMode, {{"Mode", 1}});
     if (mode_settle_sec_ > 0.0) {
         ros::Duration(mode_settle_sec_).sleep();
     }
 
     if (waitForFreshBasicStatus(status_wait_timeout_sec_, status) && status.control_usage_mode != 1) {
-        ROS_WARN("[deep_bridge] usage mode readback mismatch after switch: got %d, expected 1 (navigation). Speed "
-                 "commands (2/25) only take effect in navigation mode.",
+        ROS_WARN("[deep_bridge] usage mode readback mismatch after switch: got %d, expected 1 (navigation). The real "
+                 "axis command (1.2.6) only takes effect in navigation mode.",
                  status.control_usage_mode);
     }
 }
@@ -354,11 +377,12 @@ void CmdVelBridge::autoStandOnStart() {
     ROS_WARN("[deep_bridge] auto_stand_on_start=true: make sure the robot has clear space before it stands up");
     ROS_INFO("[deep_bridge] requesting stand (MotionParam=1) ...");
 
-    // basic_server 协议 4.2：运动状态转换（Cmd=22）可下发的 MotionParam 只有
-    // 1=站立 / 2=软急停 / 4=趴下。站立(1) 是临时过渡状态，机器人会自动跳转到
-    // RL 控制(17)——唯一可执行移动控制和步态切换的状态，所以这里只发站立指令，
-    // 再用 BasicStatus(MotionState) 回读确认是否已经进入 17（协议 6 节快速启动流程）。
-    sendRequest(2, 22, {{"MotionParam", 1}});  // Type=2 Command=22：运动状态转换，协议 4.2
+    // 指南 1.2.3 运动状态转换。MotionParam 可下发 1=站立 / 2=关节阻尼 / 3=开机阻尼 /
+    // 4=趴下 / 5=标零 / 16=小车移动 / 17=RL控制 / 0x1001=阻尼趴下（空闲与软急停只支持
+    // 查询，不支持下发）。站立(1) 是临时过渡状态，机器人会自动跳转到 RL 控制(17)——
+    // 唯一可执行移动控制和步态切换的状态，所以这里只发站立指令，再用 BasicStatus
+    // 的 MotionState 回读确认是否已经进入 17。
+    sendRequest(protocol::msg::kTypeMotion, protocol::msg::kCmdMotionState, {{"MotionParam", 1}});
 
     if (stand_settle_sec_ > 0.0) {
         ROS_INFO_STREAM("[deep_bridge] waiting " << stand_settle_sec_ << "s for stand-up to physically settle...");
@@ -385,9 +409,9 @@ void CmdVelBridge::autoStandOnStart() {
 
 void CmdVelBridge::applyGaitOnStart() {
     ROS_INFO("[deep_bridge] requesting gait 0x%04X (%d) ...", gait_on_start_, gait_on_start_);
-    // Type=2 Command=23：步态切换（basic_server 协议 4.3）。
-    // 仅在 RL 控制状态(17)且机器人静止时有效，所以必须等起立完成进入 17 之后再切。
-    sendRequest(2, 23, {{"GaitParam", gait_on_start_}});
+    // 指南 1.2.4 运动步态切换。仅在 RL 控制状态(17)且机器人静止时有效，所以必须等
+    // 起立完成进入 17 之后再切。切步态会自动切到该步态对应的运动模式，反之亦然。
+    sendRequest(protocol::msg::kTypeMotion, protocol::msg::kCmdGait, {{"GaitParam", gait_on_start_}});
     if (mode_settle_sec_ > 0.0) {
         ros::Duration(mode_settle_sec_).sleep();
     }
@@ -424,7 +448,8 @@ void CmdVelBridge::heartbeatLoop() {
     constexpr double kPollStep = 0.05;  // 小步 sleep，保证 running_=false 后能及时退出
 
     while (running_.load()) {
-        sendRequest(100, 100, nlohmann::json::object());  // Type=100 Command=100：心跳指令，手册 1.2.1
+        // 指南 1.2.1 心跳指令，建议不小于 1Hz；机器人只向持续发心跳的 IP:端口上报状态
+        sendRequest(protocol::msg::kTypeHeartbeat, protocol::msg::kCmdHeartbeat, nlohmann::json::object());
 
         double waited = 0.0;
         while (running_.load() && waited < period_sec) {
@@ -472,8 +497,9 @@ void CmdVelBridge::controlTimerCallback(const ros::TimerEvent&) {
         return;
     }
 
-    // Cmd=25 传的是实际速度值（m/s、rad/s），直接下发 cmd_vel 并夹到配置的上限。
-    // 参考协议 4.5 的步态有效速度范围（如 0x3002 平地/敏捷：X ±2.0 m/s、Y ±1.0 m/s、Yaw ±1.5 rad/s）。
+    // 真实轴指令传的是实际速度值（m/s、rad/s），直接下发 cmd_vel 并夹到配置的上限。
+    // 指南 1.2.6 明确"App下发的数据会原样传递给执行端，不会做额外的速度限制"，也没有
+    // 再给出分步态的速度有效范围——机器人侧不兜底，这里的 Clamp 就是唯一的限速。
     const double x = Clamp(vx, max_vx_);
     const double y = Clamp(vy, max_vy_);
     const double yaw = Clamp(vyaw, max_vyaw_);
