@@ -18,6 +18,17 @@ double Clamp(double v, double max_v) {
     return std::max(-max_v, std::min(max_v, v));
 }
 
+// cmd_vel 的 m/s / rad/s -> 指南 1.2.5 轴指令要求的 [-1,1] 归一化比例。
+// 先按安全限速夹到 ±max_v，再除以满量程；full_scale 配错时返回 0 而不是除出一个
+// 巨大的比例——宁可不动，也不能因为配置失误让机器人全速冲出去。
+double Normalize(double v, double max_v, double full_scale) {
+    if (full_scale <= 1e-6) {
+        return 0.0;
+    }
+    const double ratio = Clamp(v, max_v) / full_scale;
+    return std::max(-1.0, std::min(1.0, ratio));
+}
+
 std::string NowLocalTimeString() {
     // 指南 1.1.6：Time 字段格式 YYYY-MM-DD HH:MM:SS，本地时区
     const std::time_t now = std::time(nullptr);
@@ -42,6 +53,9 @@ CmdVelBridge::CmdVelBridge(ros::NodeHandle& nh, ros::NodeHandle& pnh) {
     pnh.param("max_vx", max_vx_, max_vx_);
     pnh.param("max_vy", max_vy_, max_vy_);
     pnh.param("max_vyaw", max_vyaw_, max_vyaw_);
+    pnh.param("full_scale_vx", full_scale_vx_, full_scale_vx_);
+    pnh.param("full_scale_vy", full_scale_vy_, full_scale_vy_);
+    pnh.param("full_scale_vyaw", full_scale_vyaw_, full_scale_vyaw_);
     pnh.param("auto_stand_on_start", auto_stand_on_start_, auto_stand_on_start_);
     pnh.param("stand_settle_sec", stand_settle_sec_, stand_settle_sec_);
     pnh.param("gait_on_start", gait_on_start_, gait_on_start_);
@@ -83,6 +97,8 @@ CmdVelBridge::CmdVelBridge(ros::NodeHandle& nh, ros::NodeHandle& pnh) {
                                              << " control_rate_hz=" << control_rate_hz_
                                              << " cmd_timeout_sec=" << cmd_timeout_sec_ << " max_vx=" << max_vx_
                                              << " max_vy=" << max_vy_ << " max_vyaw=" << max_vyaw_
+                                             << " full_scale=[" << full_scale_vx_ << "," << full_scale_vy_ << ","
+                                             << full_scale_vyaw_ << "]"
                                              << " auto_stand_on_start=" << auto_stand_on_start_);
 }
 
@@ -138,6 +154,9 @@ void CmdVelBridge::receiveLoop() {
 }
 
 void CmdVelBridge::handleAsdu(const std::string& asdu_json) {
+    // 排协议问题时把日志级别开到 DEBUG 就能看到每条原始 ASDU。用 INFO 会刷屏：
+    // 状态上报 2Hz，加上每条速度指令都会回一条通用响应，20Hz 下一秒二十多条。
+    ROS_DEBUG("[deep_bridge] received ASDU: %s", asdu_json.c_str());
     nlohmann::json root;
     try {
         root = nlohmann::json::parse(asdu_json);
@@ -174,9 +193,9 @@ void CmdVelBridge::handleAsdu(const std::string& asdu_json) {
     // 异常状态（日志可见性），以及指南 1.5 的通用接口调用状态响应（请求是否被接受）。
     // 运控状态(1.3.1.2)、设备状态(1.3.1.3)、巡检类(1.4)指南里都有定义，暂不需要，
     // 按需在这里加分支即可。
-    if (type == protocol::msg::kTypeBasicStatus && command == protocol::msg::kCmdStatusReport) {
+    if (protocol::msg::isBasicStatusType(type) && command == protocol::msg::kCmdStatusReport) {
         handleBasicStatus(items);
-    } else if (type == protocol::msg::kTypeAbnormalStatus && command == protocol::msg::kCmdStatusReport) {
+    } else if (protocol::msg::isAbnormalStatusType(type) && command == protocol::msg::kCmdStatusReport) {
         handleAbnormalStatus(items);
     } else if (items.contains("ErrorCode")) {
         // 指南 1.5：通用响应的 Type/Command 与请求原样相同，没有自己的专用取值，
@@ -207,8 +226,8 @@ void CmdVelBridge::handleGenericResponse(int type, int command, const nlohmann::
 }
 
 void CmdVelBridge::handleBasicStatus(const nlohmann::json& items) {
-    // ROS_INFO("[deep_bridge] received BasicStatus ASDU: %s", items.dump().c_str());
-    
+    ROS_INFO("[deep_bridge] received BasicStatus ASDU: %s", items.dump().c_str());
+
     if (!items.contains("BasicStatus")) {
         ROS_WARN_THROTTLE(5.0, "[deep_bridge] dropped BasicStatus ASDU without BasicStatus field at %s:%d", __FILE__, __LINE__);
         return;
@@ -343,32 +362,32 @@ bool CmdVelBridge::sendRequest(int type, int command, const nlohmann::json& item
 
 void CmdVelBridge::sendSpeedCommand(double x, double y, double yaw, double z, double roll, double pitch) {
     const nlohmann::json items = {{"X", x}, {"Y", y}, {"Z", z}, {"Roll", roll}, {"Pitch", pitch}, {"Yaw", yaw}};
-    // 指南 1.2.6 真实轴指令：字段与 1.2.5 轴指令相同，区别是这里传的是实际速度值
-    // （X/Y/Z 为 m/s，Roll/Pitch/Yaw 为 rad/s，不做归一化、不再额外限速），且仅在导航
-    // 模式下生效——正好对上 cmd_vel 的语义，所以用它而不是 1.2.5 的 [-1,1] 归一化轴指令
-    // （那个只在常规/辅助模式下执行）。基础步态只响应 X、Y、Yaw，Z/Roll/Pitch 填 0。
-    sendRequest(protocol::msg::kTypeMotion, protocol::msg::kCmdAxisReal, items);
+    // 指南 1.2.5 运动控制（轴指令）：六个分量都是 [-1,1] 的归一化比例，表示"占最大速度
+    // 的比例"，不是实际速度——m/s 的换算在 controlTimerCallback 里用 full_scale_v* 做。
+    // 该指令仅支持在常规模式和辅助模式下执行（对应 1.2.6 真实轴指令则只在导航模式下生效）。
+    // 指南 1.2.5 注：仅特殊步态下六轴全部有效，基础步态只响应 X、Y、Yaw，Z/Roll/Pitch 填 0。
+    sendRequest(protocol::msg::kTypeMotion, protocol::msg::kCmdAxisNormalized, items);
 }
 
 void CmdVelBridge::applyUsageMode() {
     BasicStatus status;
     if (!waitForFreshBasicStatus(status_wait_timeout_sec_, status)) {
         ROS_WARN("[deep_bridge] timed out waiting for initial status report; sending usage-mode switch anyway");
-    } else if (status.control_usage_mode == 1) {
-        ROS_INFO("[deep_bridge] already in navigation usage mode, skip switch");
+    } else if (status.control_usage_mode == 0) {
+        ROS_INFO("[deep_bridge] already in regular usage mode, skip switch");
         return;
     }
 
-    ROS_INFO("[deep_bridge] switching to navigation usage mode (Mode=1) ...");
+    ROS_INFO("[deep_bridge] switching to regular usage mode (Mode=0) ...");
     // 指南 1.2.2 使用模式切换；Mode：0 常规 / 1 导航 / 2 辅助
-    sendRequest(protocol::msg::kTypeUsageMode, protocol::msg::kCmdUsageMode, {{"Mode", 1}});
+    sendRequest(protocol::msg::kTypeUsageMode, protocol::msg::kCmdUsageMode, {{"Mode", 0}});
     if (mode_settle_sec_ > 0.0) {
         ros::Duration(mode_settle_sec_).sleep();
     }
 
-    if (waitForFreshBasicStatus(status_wait_timeout_sec_, status) && status.control_usage_mode != 1) {
-        ROS_WARN("[deep_bridge] usage mode readback mismatch after switch: got %d, expected 1 (navigation). The real "
-                 "axis command (1.2.6) only takes effect in navigation mode.",
+    if (waitForFreshBasicStatus(status_wait_timeout_sec_, status) && status.control_usage_mode != 0) {
+        ROS_WARN("[deep_bridge] usage mode readback mismatch after switch: got %d, expected 0 (regular). The "
+                 "normalized axis command (1.2.5) only takes effect in regular and assist modes.",
                  status.control_usage_mode);
     }
 }
@@ -410,7 +429,8 @@ void CmdVelBridge::autoStandOnStart() {
 void CmdVelBridge::applyGaitOnStart() {
     ROS_INFO("[deep_bridge] requesting gait 0x%04X (%d) ...", gait_on_start_, gait_on_start_);
     // 指南 1.2.4 运动步态切换。仅在 RL 控制状态(17)且机器人静止时有效，所以必须等
-    // 起立完成进入 17 之后再切。切步态会自动切到该步态对应的运动模式，反之亦然。
+    // 起立完成进入 17 之后再切。切步态会自动切到该步态对应的运动模式，反之亦然——
+    // 所以常规模式下要用标准运动模式的步态(0x100x)，不能用导航运动模式的 0x3002/0x3003。
     sendRequest(protocol::msg::kTypeMotion, protocol::msg::kCmdGait, {{"GaitParam", gait_on_start_}});
     if (mode_settle_sec_ > 0.0) {
         ros::Duration(mode_settle_sec_).sleep();
@@ -479,12 +499,14 @@ void CmdVelBridge::controlTimerCallback(const ros::TimerEvent&) {
         status = last_basic_status_;
     }
 
-    // 安全闸门：还没收到过状态上报 / 硬急停触发 / 不在导航模式 / 运动状态不是
+    // 安全闸门：还没收到过状态上报 / 硬急停触发 / 不在常规模式 / 运动状态不是
     // 可行走的 RL 控制态（17）时，一律发全零速度指令，不管 cmd_vel
     // 是否还在正常到达——跟 unitree_bridge 的 cmd_timeout 看门狗同样的思路，
-    // 只是这里多了几条闸门条件，因为 M20 的"能不能走"不只取决于有没有新指令。
+    // 只是这里多了几条闸门条件，因为 M20S 的"能不能走"不只取决于有没有新指令。
+    // 指南 1.2.5 说辅助模式(2)也能执行轴指令，但这里只认我们自己切过去的常规模式(0)：
+    // 模式和预期不符本身就说明有别的东西在动机器人，此时停住比继续走安全。
     const bool safe_to_drive =
-        status.valid && status.hes == 0 && status.control_usage_mode == 1 && status.motion_state == 17;
+        status.valid && status.hes == 0 && status.control_usage_mode == 0 && status.motion_state == 17;
 
     if (timed_out || !safe_to_drive) {
         if (!safe_to_drive) {
@@ -497,12 +519,11 @@ void CmdVelBridge::controlTimerCallback(const ros::TimerEvent&) {
         return;
     }
 
-    // 真实轴指令传的是实际速度值（m/s、rad/s），直接下发 cmd_vel 并夹到配置的上限。
-    // 指南 1.2.6 明确"App下发的数据会原样传递给执行端，不会做额外的速度限制"，也没有
-    // 再给出分步态的速度有效范围——机器人侧不兜底，这里的 Clamp 就是唯一的限速。
-    const double x = Clamp(vx, max_vx_);
-    const double y = Clamp(vy, max_vy_);
-    const double yaw = Clamp(vyaw, max_vyaw_);
+    // 归一化轴指令要的是比例不是速度：先按 max_v* 限速，再除以 full_scale_v* 换算。
+    // full_scale_v* 是"轴指令 ±1.0 对应多少实际速度"，指南没给，需要实测校准。
+    const double x = Normalize(vx, max_vx_, full_scale_vx_);
+    const double y = Normalize(vy, max_vy_, full_scale_vy_);
+    const double yaw = Normalize(vyaw, max_vyaw_, full_scale_vyaw_);
     sendSpeedCommand(x, y, yaw);
 }
 

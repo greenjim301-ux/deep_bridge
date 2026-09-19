@@ -54,6 +54,20 @@ constexpr int kCmdAxisReal = 0x00110002;        // 1.2.6 真实轴指令，m/s �
 constexpr int kTypeBasicStatus = 0x00100064;    // 1.3.1.1 基础状态上报，2Hz
 constexpr int kTypeAbnormalStatus = 0x0010007F; // 1.3.1.4 异常状态上报，2Hz
 constexpr int kCmdStatusReport = 0x00F00000;
+
+// 实测（2026-09-19，lubancat 上对真机）：本体上报的 Type 高半字是 0x0030，不是指南
+// 1.3.1.1/1.3.1.4 写的 0x0010，低半字一致。只认指南的值会收不到任何状态上报，安全
+// 闸门就永远打不开。两套都收：指南的值留着，万一别的固件版本按文档来。
+// 注意控制类请求（1.2.x）用 0x0010 是对的——心跳发 0x00100064 本体确实会开始上报。
+constexpr int kTypeBasicStatusAlt = 0x00300064;
+constexpr int kTypeAbnormalStatusAlt = 0x0030007F;
+
+inline bool isBasicStatusType(int type) {
+    return type == kTypeBasicStatus || type == kTypeBasicStatusAlt;
+}
+inline bool isAbnormalStatusType(int type) {
+    return type == kTypeAbnormalStatus || type == kTypeAbnormalStatusAlt;
+}
 }  // namespace msg
 
 // 组一个完整 APDU：协议头 + ASDU JSON 字节。asdu_json 必须已经是最终要发送的

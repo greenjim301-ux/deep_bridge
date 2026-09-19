@@ -1,11 +1,14 @@
 /*
  * deep_bridge_node
  *
- * 订阅 cmd_vel（geometry_msgs::Twist），按固定频率通过云深处山猫 M20 的
- * UDP/JSON 本体监控协议下发速度指令（Type=2 Command=25，仅导航模式下生效）。
+ * 订阅 cmd_vel（geometry_msgs::Twist），按固定频率通过云深处山猫 M20S 的
+ * UDP/JSON 本体监控协议下发归一化轴指令（指南 1.2.5，仅常规/辅助模式下生效）。
  * 跟 unitree_bridge 是同一个定位（cmd_vel -> 具体机型的 SDK/协议），只是
- * M20 没有官方 C++ SDK，协议是裸 UDP + JSON，所以这个包自己实现协议的组包/
+ * M20S 没有官方 C++ SDK，协议是裸 UDP + JSON，所以这个包自己实现协议的组包/
  * 解包（见 UdpProtocol.h）和收发（本类）。
+ *
+ * 注意轴指令传的是"占最大速度的比例"而不是实际速度，所以 cmd_vel 的 m/s 要靠
+ * full_scale_v* 换算，见下面那组参数。
  *
  * 协议来源：《山猫M20S 开发资料》-「软件开发指南」V1.0.0 (2026-06-15)。
  * 机器人本体是 UDP 服务端，这个节点是客户端。
@@ -55,7 +58,7 @@ private:
         // "高台(标准)"对不上；两处一致的只有导航运动模式的 0x3002/0x3003，也正是这里用的。
         int gait = -1;
         int hes = -1;                 // Hard Emergency Stop：0未触发 1已触发
-        int control_usage_mode = -1;  // 使用模式：0常规 1导航 2辅助；真实轴指令(1.2.6)仅在导航模式下生效
+        int control_usage_mode = -1;  // 使用模式：0常规 1导航 2辅助；归一化轴指令(1.2.5)仅在常规/辅助模式下生效
         bool sleep = false;
         bool valid = false;
         ros::Time stamp;
@@ -81,9 +84,9 @@ private:
     void sendSpeedCommand(double x, double y, double yaw, double z = 0.0, double roll = 0.0, double pitch = 0.0);
 
     // ---- 启动流程（构造函数里顺序调用，全部做完才建 cmd_vel 订阅者） ----
-    void applyUsageMode();     // 确保处于导航模式（指南 1.2.2 Mode=1），真实轴指令的前提条件
+    void applyUsageMode();     // 确保处于常规模式（指南 1.2.2 Mode=0），归一化轴指令的前提条件
     void autoStandOnStart();   // 下发起立指令（指南 1.2.3 MotionParam=1），自动进入 RL 控制(17)
-    void applyGaitOnStart();   // 可选：额外请求步态（指南 1.2.4），默认 0x3002 平地(导航运动模式)
+    void applyGaitOnStart();   // 可选：额外请求步态（指南 1.2.4），默认 0x1001 基础(标准运动模式)
     void logFinalStatus();
 
     // ---- ROS 回调 ----
@@ -127,13 +130,24 @@ private:
     double cmd_timeout_sec_ = 0.5;   // 超过这么久没收到新 cmd_vel 就发全零速度指令（安全看门狗）
     double heartbeat_rate_hz_ = 2.0; // 心跳频率，指南 1.2.1 要求不小于 1Hz，且先发心跳才会收到状态上报
 
-    double max_vx_ = 0.75;  // [m/s]，真实轴指令 X 的钳位上限：cmd_vel 的 linear.x 按 m/s 直接下发并夹到 ±max_vx_
+    // 安全限速：cmd_vel 先按 m/s / rad/s 夹到这里，再换算成归一化比例
+    double max_vx_ = 0.75;  // [m/s]
     double max_vy_ = 0.6;   // [m/s]
     double max_vyaw_ = 1.0; // [rad/s]
 
+    // 归一化轴指令(指南 1.2.5)的满量程：轴指令里的 ±1.0 对应多大的实际速度。
+    // 换算就是 ratio = clamp(cmd_vel, ±max_v) / full_scale_v，再夹到 ±1。
+    // 指南没有给出任何分步态的速度数值，这里的默认值来自旧版《山猫M20 开发指南》
+    // basic_server 协议 4.5 给出的 0x3002 平地步态范围（X ±2.0 / Y ±1.0 / Yaw ±1.5）——
+    // 那是导航运动模式的步态，常规模式用的基础步态(0x1001)未必相同，**必须实测校准**。
+    // 校准前宁可设大不设小：设大了机器人走得比指令慢，设小了会比指令快。
+    double full_scale_vx_ = 2.0;   // [m/s]
+    double full_scale_vy_ = 1.0;   // [m/s]
+    double full_scale_vyaw_ = 1.5; // [rad/s]
+
     bool auto_stand_on_start_ = true;
     double stand_settle_sec_ = 5.0;
-    int gait_on_start_ = 0x3002;  // 0x3002=12290 平地(导航运动模式)，见 CmdVelBridge.cpp applyGaitOnStart() 注释
+    int gait_on_start_ = 0x1001;  // 0x1001=4097 基础(标准运动模式)，见 CmdVelBridge.cpp applyGaitOnStart() 注释
     double mode_settle_sec_ = 1.0;
 
     bool set_usage_mode_on_start_ = true;
