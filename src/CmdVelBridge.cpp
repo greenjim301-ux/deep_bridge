@@ -10,6 +10,16 @@
 namespace deep_bridge {
 
 namespace {
+
+// 指南 1.2.2 的使用模式取值。只支持这两种：辅助模式(2) 虽然也能执行归一化轴指令，
+// 但这个桥接节点用不到，与其留一条从来没走过的分支，不如明确不支持。
+constexpr int kUsageModeRegular = 0;
+constexpr int kUsageModeNavigation = 1;
+
+const char* UsageModeName(int mode) {
+    return mode == kUsageModeNavigation ? "navigation" : "regular";
+}
+
 double Clamp(double v, double max_v) {
     // max_v<=0 是配置错误，当成"没有配置限速"处理，输出 0 而不是原值
     if (max_v <= 1e-6) {
@@ -50,6 +60,7 @@ CmdVelBridge::CmdVelBridge(ros::NodeHandle& nh, ros::NodeHandle& pnh) {
     pnh.param("control_rate_hz", control_rate_hz_, control_rate_hz_);
     pnh.param("cmd_timeout_sec", cmd_timeout_sec_, cmd_timeout_sec_);
     pnh.param("heartbeat_rate_hz", heartbeat_rate_hz_, heartbeat_rate_hz_);
+    pnh.param("usage_mode", usage_mode_, usage_mode_);
     pnh.param("max_vx", max_vx_, max_vx_);
     pnh.param("max_vy", max_vy_, max_vy_);
     pnh.param("max_vyaw", max_vyaw_, max_vyaw_);
@@ -62,6 +73,12 @@ CmdVelBridge::CmdVelBridge(ros::NodeHandle& nh, ros::NodeHandle& pnh) {
     pnh.param("mode_settle_sec", mode_settle_sec_, mode_settle_sec_);
     pnh.param("set_usage_mode_on_start", set_usage_mode_on_start_, set_usage_mode_on_start_);
     pnh.param("status_wait_timeout_sec", status_wait_timeout_sec_, status_wait_timeout_sec_);
+
+    if (usage_mode_ != kUsageModeRegular && usage_mode_ != kUsageModeNavigation) {
+        ROS_WARN("[deep_bridge] unsupported usage_mode=%d, falling back to %d (regular)", usage_mode_,
+                  kUsageModeRegular);
+        usage_mode_ = kUsageModeRegular;
+    }
 
     openTransport();
 
@@ -93,6 +110,11 @@ CmdVelBridge::CmdVelBridge(ros::NodeHandle& nh, ros::NodeHandle& pnh) {
 
     ROS_INFO_STREAM("[deep_bridge] server=" << server_ip_ << ":" << server_port_
                                              << (use_dtls_ ? " (DTLS)" : " (plain UDP)")
+                                             << " usage_mode=" << usage_mode_ << " ("
+                                             << UsageModeName(usage_mode_) << ", "
+                                             << (usage_mode_ == kUsageModeNavigation ? "real axis cmd 1.2.6"
+                                                                                     : "normalized axis cmd 1.2.5")
+                                             << ")"
                                              << " cmd_vel_topic=" << cmd_vel_topic_
                                              << " control_rate_hz=" << control_rate_hz_
                                              << " cmd_timeout_sec=" << cmd_timeout_sec_ << " max_vx=" << max_vx_
@@ -362,33 +384,36 @@ bool CmdVelBridge::sendRequest(int type, int command, const nlohmann::json& item
 
 void CmdVelBridge::sendSpeedCommand(double x, double y, double yaw, double z, double roll, double pitch) {
     const nlohmann::json items = {{"X", x}, {"Y", y}, {"Z", z}, {"Roll", roll}, {"Pitch", pitch}, {"Yaw", yaw}};
-    // 指南 1.2.5 运动控制（轴指令）：六个分量都是 [-1,1] 的归一化比例，表示"占最大速度
-    // 的比例"，不是实际速度——m/s 的换算在 controlTimerCallback 里用 full_scale_v* 做。
-    // 该指令仅支持在常规模式和辅助模式下执行（对应 1.2.6 真实轴指令则只在导航模式下生效）。
+    // 轴指令的种类必须和使用模式配对，否则本体直接不认：
+    //   常规模式 -> 指南 1.2.5 归一化轴指令，六个分量是 [-1,1] 的"占最大速度的比例"，
+    //               m/s 的换算在 controlTimerCallback 里用 full_scale_v* 做；
+    //   导航模式 -> 指南 1.2.6 真实轴指令，字段完全相同但值直接是 m/s 与 rad/s。
     // 指南 1.2.5 注：仅特殊步态下六轴全部有效，基础步态只响应 X、Y、Yaw，Z/Roll/Pitch 填 0。
-    sendRequest(protocol::msg::kTypeMotion, protocol::msg::kCmdAxisNormalized, items);
+    const int command = usage_mode_ == kUsageModeNavigation ? protocol::msg::kCmdAxisReal
+                                                            : protocol::msg::kCmdAxisNormalized;
+    sendRequest(protocol::msg::kTypeMotion, command, items);
 }
 
 void CmdVelBridge::applyUsageMode() {
     BasicStatus status;
     if (!waitForFreshBasicStatus(status_wait_timeout_sec_, status)) {
         ROS_WARN("[deep_bridge] timed out waiting for initial status report; sending usage-mode switch anyway");
-    } else if (status.control_usage_mode == 0) {
-        ROS_INFO("[deep_bridge] already in regular usage mode, skip switch");
+    } else if (status.control_usage_mode == usage_mode_) {
+        ROS_INFO("[deep_bridge] already in %s usage mode, skip switch", UsageModeName(usage_mode_));
         return;
     }
 
-    ROS_INFO("[deep_bridge] switching to regular usage mode (Mode=0) ...");
+    ROS_INFO("[deep_bridge] switching to %s usage mode (Mode=%d) ...", UsageModeName(usage_mode_), usage_mode_);
     // 指南 1.2.2 使用模式切换；Mode：0 常规 / 1 导航 / 2 辅助
-    sendRequest(protocol::msg::kTypeUsageMode, protocol::msg::kCmdUsageMode, {{"Mode", 0}});
+    sendRequest(protocol::msg::kTypeUsageMode, protocol::msg::kCmdUsageMode, {{"Mode", usage_mode_}});
     if (mode_settle_sec_ > 0.0) {
         ros::Duration(mode_settle_sec_).sleep();
     }
 
-    if (waitForFreshBasicStatus(status_wait_timeout_sec_, status) && status.control_usage_mode != 0) {
-        ROS_WARN("[deep_bridge] usage mode readback mismatch after switch: got %d, expected 0 (regular). The "
-                 "normalized axis command (1.2.5) only takes effect in regular and assist modes.",
-                 status.control_usage_mode);
+    if (waitForFreshBasicStatus(status_wait_timeout_sec_, status) && status.control_usage_mode != usage_mode_) {
+        ROS_WARN("[deep_bridge] usage mode readback mismatch after switch: got %d, expected %d (%s). The axis "
+                 "command this node sends only takes effect in that mode.",
+                 status.control_usage_mode, usage_mode_, UsageModeName(usage_mode_));
     }
 }
 
@@ -429,8 +454,10 @@ void CmdVelBridge::autoStandOnStart() {
 void CmdVelBridge::applyGaitOnStart() {
     ROS_INFO("[deep_bridge] requesting gait 0x%04X (%d) ...", gait_on_start_, gait_on_start_);
     // 指南 1.2.4 运动步态切换。仅在 RL 控制状态(17)且机器人静止时有效，所以必须等
-    // 起立完成进入 17 之后再切。切步态会自动切到该步态对应的运动模式，反之亦然——
-    // 所以常规模式下要用标准运动模式的步态(0x100x)，不能用导航运动模式的 0x3002/0x3003。
+    // 起立完成进入 17 之后再切。
+    // 注意步态表里的"标准/导航运动模式"是指南 1.2.3 的运动模式，跟这里的使用模式
+    // (常规/导航，指南 1.2.2)是两个维度——实测导航使用模式下用基础步态(0x1001)也能跑，
+    // 所以 gait_on_start 不跟着 usage_mode 走，两者各自配置。
     sendRequest(protocol::msg::kTypeMotion, protocol::msg::kCmdGait, {{"GaitParam", gait_on_start_}});
     if (mode_settle_sec_ > 0.0) {
         ros::Duration(mode_settle_sec_).sleep();
@@ -499,14 +526,14 @@ void CmdVelBridge::controlTimerCallback(const ros::TimerEvent&) {
         status = last_basic_status_;
     }
 
-    // 安全闸门：还没收到过状态上报 / 硬急停触发 / 不在常规模式 / 运动状态不是
-    // 可行走的 RL 控制态（17）时，一律发全零速度指令，不管 cmd_vel
+    // 安全闸门：还没收到过状态上报 / 硬急停触发 / 使用模式不是我们切过去的那个 /
+    // 运动状态不是可行走的 RL 控制态（17）时，一律发全零速度指令，不管 cmd_vel
     // 是否还在正常到达——跟 unitree_bridge 的 cmd_timeout 看门狗同样的思路，
     // 只是这里多了几条闸门条件，因为 M20S 的"能不能走"不只取决于有没有新指令。
-    // 指南 1.2.5 说辅助模式(2)也能执行轴指令，但这里只认我们自己切过去的常规模式(0)：
-    // 模式和预期不符本身就说明有别的东西在动机器人，此时停住比继续走安全。
-    const bool safe_to_drive =
-        status.valid && status.hes == 0 && status.control_usage_mode == 0 && status.motion_state == 17;
+    // 使用模式必须严格等于 usage_mode_：一来轴指令只在配对的模式下生效，二来模式
+    // 和预期不符本身就说明有别的东西在动机器人，此时停住比继续走安全。
+    const bool safe_to_drive = status.valid && status.hes == 0 &&
+                               status.control_usage_mode == usage_mode_ && status.motion_state == 17;
 
     if (timed_out || !safe_to_drive) {
         if (!safe_to_drive) {
@@ -519,12 +546,16 @@ void CmdVelBridge::controlTimerCallback(const ros::TimerEvent&) {
         return;
     }
 
-    // 归一化轴指令要的是比例不是速度：先按 max_v* 限速，再除以 full_scale_v* 换算。
-    // full_scale_v* 是"轴指令 ±1.0 对应多少实际速度"，指南没给，需要实测校准。
-    const double x = Normalize(vx, max_vx_, full_scale_vx_);
-    const double y = Normalize(vy, max_vy_, full_scale_vy_);
-    const double yaw = Normalize(vyaw, max_vyaw_, full_scale_vyaw_);
-    sendSpeedCommand(x, y, yaw);
+    if (usage_mode_ == kUsageModeNavigation) {
+        // 真实轴指令直接下发实际速度。指南 1.2.6 明确"App下发的数据会原样传递给执行端，
+        // 不会做额外的速度限制"，也没给分步态的有效范围——本体不兜底，这里就是唯一的限速。
+        sendSpeedCommand(Clamp(vx, max_vx_), Clamp(vy, max_vy_), Clamp(vyaw, max_vyaw_));
+    } else {
+        // 归一化轴指令要的是比例不是速度：先按 max_v* 限速，再除以 full_scale_v* 换算。
+        // full_scale_v* 是"轴指令 ±1.0 对应多少实际速度"，指南没给，需要实测校准。
+        sendSpeedCommand(Normalize(vx, max_vx_, full_scale_vx_), Normalize(vy, max_vy_, full_scale_vy_),
+                         Normalize(vyaw, max_vyaw_, full_scale_vyaw_));
+    }
 }
 
 }  // namespace deep_bridge
