@@ -177,7 +177,7 @@ void CmdVelBridge::receiveLoop() {
 void CmdVelBridge::handleAsdu(const std::string& asdu_json) {
     // 排协议问题时把日志级别开到 DEBUG 就能看到每条原始 ASDU。用 INFO 会刷屏：
     // 状态上报 2Hz，加上每条速度指令都会回一条通用响应，20Hz 下一秒二十多条。
-    ROS_DEBUG("[deep_bridge] received ASDU: %s", asdu_json.c_str());
+    // ROS_DEBUG("[deep_bridge] received ASDU: %s", asdu_json.c_str());
     nlohmann::json root;
     try {
         root = nlohmann::json::parse(asdu_json);
