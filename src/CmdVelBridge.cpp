@@ -28,15 +28,14 @@ double Clamp(double v, double max_v) {
     return std::max(-max_v, std::min(max_v, v));
 }
 
-// cmd_vel 的 m/s / rad/s -> 指南 1.2.5 轴指令要求的 [-1,1] 归一化比例。
-// 先按安全限速夹到 ±max_v，再除以满量程；full_scale 配错时返回 0 而不是除出一个
-// 巨大的比例——宁可不动，也不能因为配置失误让机器人全速冲出去。
-double Normalize(double v, double max_v, double full_scale) {
+// 实际速度 -> 指南 1.2.5 轴指令要求的 [-1,1] 归一化比例。
+// full_scale 配错时返回 0 而不是除出一个巨大的比例——宁可不动，也不能因为配置
+// 失误让机器人全速冲出去。
+double ToRatio(double v, double full_scale) {
     if (full_scale <= 1e-6) {
         return 0.0;
     }
-    const double ratio = Clamp(v, max_v) / full_scale;
-    return std::max(-1.0, std::min(1.0, ratio));
+    return std::max(-1.0, std::min(1.0, v / full_scale));
 }
 
 std::string NowLocalTimeString() {
@@ -546,15 +545,19 @@ void CmdVelBridge::controlTimerCallback(const ros::TimerEvent&) {
         return;
     }
 
+    // 两种模式共用的限幅：按安全限速夹住。指南 1.2.6 明确本体"不会做额外的速度限制"，
+    // 所以这一步就是唯一的约束。
+    const double vx_eff = Clamp(vx, max_vx_);
+    const double vy_eff = Clamp(vy, max_vy_);
+    const double vyaw_eff = Clamp(vyaw, max_vyaw_);
+
     if (usage_mode_ == kUsageModeNavigation) {
-        // 真实轴指令直接下发实际速度。指南 1.2.6 明确"App下发的数据会原样传递给执行端，
-        // 不会做额外的速度限制"，也没给分步态的有效范围——本体不兜底，这里就是唯一的限速。
-        sendSpeedCommand(Clamp(vx, max_vx_), Clamp(vy, max_vy_), Clamp(vyaw, max_vyaw_));
+        // 真实轴指令直接下发实际速度
+        sendSpeedCommand(vx_eff, vy_eff, vyaw_eff);
     } else {
-        // 归一化轴指令要的是比例不是速度：先按 max_v* 限速，再除以 full_scale_v* 换算。
-        // full_scale_v* 是"轴指令 ±1.0 对应多少实际速度"，指南没给，需要实测校准。
-        sendSpeedCommand(Normalize(vx, max_vx_, full_scale_vx_), Normalize(vy, max_vy_, full_scale_vy_),
-                         Normalize(vyaw, max_vyaw_, full_scale_vyaw_));
+        // 归一化轴指令要的是比例不是速度，再除以满量程换算
+        sendSpeedCommand(ToRatio(vx_eff, full_scale_vx_), ToRatio(vy_eff, full_scale_vy_),
+                         ToRatio(vyaw_eff, full_scale_vyaw_));
     }
 }
 

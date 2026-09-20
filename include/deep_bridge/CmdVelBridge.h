@@ -146,15 +146,13 @@ private:
     double max_vyaw_ = 1.0; // [rad/s]
 
     // 归一化轴指令(指南 1.2.5)的满量程：轴指令里的 ±1.0 对应多大的实际速度。
-    // 换算就是 ratio = clamp(cmd_vel, ±max_v) / full_scale_v，再夹到 ±1。
+    // 换算就是 ratio = v / full_scale_v，再夹到 ±1。
     // 只在 usage_mode=0 时用到；导航模式直接下发实际速度，不需要换算。
-    // 指南没有给出任何分步态的速度数值，这里的默认值来自旧版《山猫M20 开发指南》
-    // basic_server 协议 4.5 给出的 0x3002 平地步态范围（X ±2.0 / Y ±1.0 / Yaw ±1.5）——
-    // 那是导航运动模式的步态，常规模式用的基础步态(0x1001)未必相同，**必须实测校准**。
-    // 校准前宁可设大不设小：设大了机器人走得比指令慢，设小了会比指令快。
+    // 取值是厂商《各个步态的有效速度范围》表（软件包 ≥V1.1.7）里区间的上界，
+    // 默认对应 gait_on_start 默认的 0x1001 标准-基础步态。完整表见 config 注释。
     double full_scale_vx_ = 2.0;   // [m/s]
     double full_scale_vy_ = 1.0;   // [m/s]
-    double full_scale_vyaw_ = 1.5; // [rad/s]
+    double full_scale_vyaw_ = 2.0; // [rad/s]
 
     bool auto_stand_on_start_ = true;
     double stand_settle_sec_ = 5.0;
