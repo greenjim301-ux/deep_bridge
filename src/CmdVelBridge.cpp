@@ -72,6 +72,7 @@ CmdVelBridge::CmdVelBridge(ros::NodeHandle& nh, ros::NodeHandle& pnh) {
     pnh.param("mode_settle_sec", mode_settle_sec_, mode_settle_sec_);
     pnh.param("set_usage_mode_on_start", set_usage_mode_on_start_, set_usage_mode_on_start_);
     pnh.param("status_wait_timeout_sec", status_wait_timeout_sec_, status_wait_timeout_sec_);
+    pnh.param("status_timeout_sec", status_timeout_sec_, status_timeout_sec_);
 
     if (usage_mode_ != kUsageModeRegular && usage_mode_ != kUsageModeNavigation) {
         ROS_WARN("[deep_bridge] unsupported usage_mode=%d, falling back to %d (regular)", usage_mode_,
@@ -91,16 +92,30 @@ CmdVelBridge::CmdVelBridge(ros::NodeHandle& nh, ros::NodeHandle& pnh) {
     // 只发一次心跳撑不了整个启动阶段（机器人这边没有持续收到心跳就会停止上报状态）。
     heartbeat_thread_ = std::thread(&CmdVelBridge::heartbeatLoop, this);
 
-    if (set_usage_mode_on_start_) {
-        applyUsageMode();
+    // 两个线程已经起来了，所以下面这几步抛异常的话不能就那么往外扔：std::thread
+    // 的析构函数对 joinable 的线程会直接 std::terminate，main 里的 catch 根本轮不上。
+    // 接住、停线程、再原样抛出去。
+    try {
+        if (set_usage_mode_on_start_) {
+            applyUsageMode();
+        }
+        if (auto_stand_on_start_) {
+            autoStandOnStart();
+        }
+        if (gait_on_start_ >= 0) {
+            applyGaitOnStart();
+        }
+        logFinalStatus();
+    } catch (...) {
+        running_ = false;
+        if (recv_thread_.joinable()) {
+            recv_thread_.join();
+        }
+        if (heartbeat_thread_.joinable()) {
+            heartbeat_thread_.join();
+        }
+        throw;
     }
-    if (auto_stand_on_start_) {
-        autoStandOnStart();
-    }
-    if (gait_on_start_ >= 0) {
-        applyGaitOnStart();
-    }
-    logFinalStatus();
 
     // 启动流程走完之后才建订阅者/控制定时器，确保切换过程中不会有速度指令跟状态切换请求打架
     cmd_vel_sub_ = nh.subscribe(cmd_vel_topic_, 1, &CmdVelBridge::cmdVelCallback, this);
@@ -214,16 +229,49 @@ void CmdVelBridge::handleAsdu(const std::string& asdu_json) {
     // 异常状态（日志可见性），以及指南 1.5 的通用接口调用状态响应（请求是否被接受）。
     // 运控状态(1.3.1.2)、设备状态(1.3.1.3)、巡检类(1.4)指南里都有定义，暂不需要，
     // 按需在这里加分支即可。
-    if (protocol::msg::isBasicStatusType(type) && command == protocol::msg::kCmdStatusReport) {
+    // **按内容分派，不按 Type 分派。** ASDU 自己就能认出来：基础状态带
+    // Items.BasicStatus，异常状态带 Items.ErrorList，通用响应(指南 1.5)带
+    // Items.ErrorCode。而 Type 的取值不可靠——实测本体上报用的高半字是 0x0030，
+    // 跟指南 1.3.1.1/1.3.1.4 写的 0x0010 对不上。按 Type 分派的代价已经付过一次：
+    // 报文全部落进 else 分支被 ROS_DEBUG 吞掉，默认日志级别下什么都看不见，
+    // 唯一的症状是每 5 秒一条 "not safe to drive (valid=0 ...)"，排查方向全跑偏。
+    if (items.contains("BasicStatus")) {
+        warnIfUnexpectedType("BasicStatus", type, protocol::msg::isBasicStatusType(type));
         handleBasicStatus(items);
-    } else if (protocol::msg::isAbnormalStatusType(type) && command == protocol::msg::kCmdStatusReport) {
+    } else if (items.contains("ErrorList")) {
+        warnIfUnexpectedType("ErrorList", type, protocol::msg::isAbnormalStatusType(type));
         handleAbnormalStatus(items);
     } else if (items.contains("ErrorCode")) {
-        // 指南 1.5：通用响应的 Type/Command 与请求原样相同，没有自己的专用取值，
-        // 只能靠 Items 里的 ErrorCode 认出来。
         handleGenericResponse(type, command, items);
     } else {
-        ROS_DEBUG_THROTTLE(10.0, "[deep_bridge] dropped ASDU Type=0x%08X Command=0x%08X", type, command);
+        // 认不出来的报文打 WARN 而不是 DEBUG：默认日志级别下看得见才有意义。
+        ROS_WARN_THROTTLE(10.0,
+                           "[deep_bridge] unrecognised ASDU Type=0x%08X Command=0x%08X, Items keys=%s",
+                           type, command, itemsKeys(items).c_str());
+    }
+}
+
+std::string CmdVelBridge::itemsKeys(const nlohmann::json& items) {
+    std::string out;
+    if (!items.is_object()) {
+        return items.type_name();
+    }
+    for (auto it = items.begin(); it != items.end(); ++it) {
+        if (!out.empty()) {
+            out += ",";
+        }
+        out += it.key();
+    }
+    return out.empty() ? std::string("(empty)") : out;
+}
+
+void CmdVelBridge::warnIfUnexpectedType(const char* what, int type, bool type_matches_guide) {
+    // 内容认出来了但 Type 跟指南对不上：照常处理，但要吵一声——这正是本体
+    // 实际发 0x0030xxxx、指南写 0x0010xxxx 的那个差异，留个记录便于对版本。
+    if (!type_matches_guide) {
+        ROS_WARN_ONCE("[deep_bridge] %s report arrives with Type=0x%08X, not the value in the guide; "
+                      "dispatching on content anyway",
+                      what, type);
     }
 }
 
@@ -531,15 +579,30 @@ void CmdVelBridge::controlTimerCallback(const ros::TimerEvent&) {
     // 只是这里多了几条闸门条件，因为 M20S 的"能不能走"不只取决于有没有新指令。
     // 使用模式必须严格等于 usage_mode_：一来轴指令只在配对的模式下生效，二来模式
     // 和预期不符本身就说明有别的东西在动机器人，此时停住比继续走安全。
-    const bool safe_to_drive = status.valid && status.hes == 0 &&
-                               status.control_usage_mode == usage_mode_ && status.motion_state == 17;
+    // 状态必须**新鲜**。valid 只说明"收到过"，不说明"现在还收得到"：上报一断，
+    // 旧的那份会一直停在 valid=true，闸门就退化成"机器人曾经说过安全"，而这期间
+    // HES / 使用模式 / 运动状态在机器人那侧都可能已经变了。cmd_vel 看门狗只覆盖
+    // 上行断流，下行断流要靠这里。
+    const double status_age = status.valid ? (ros::Time::now() - status.stamp).toSec() : 0.0;
+    const bool status_fresh = status.valid && status_age <= status_timeout_sec_;
+
+    // 步态决定 full_scale_v* 的取值（config 里那张表就是按步态给的），所以运行期
+    // 换了步态，归一化的比例就整体错了。gait_on_start_ < 0 表示不管步态，那就不查。
+    const bool gait_ok = gait_on_start_ < 0 || status.gait == gait_on_start_;
+
+    const bool safe_to_drive = status_fresh && status.hes == 0 &&
+                               status.control_usage_mode == usage_mode_ &&
+                               status.motion_state == 17 && gait_ok;
 
     if (timed_out || !safe_to_drive) {
         if (!safe_to_drive) {
             ROS_WARN_THROTTLE(5.0,
-                               "[deep_bridge] not safe to drive (valid=%d HES=%d control_usage_mode=%d "
-                               "motion_state=%d), sending zero speed command",
-                               status.valid, status.hes, status.control_usage_mode, status.motion_state);
+                               "[deep_bridge] not safe to drive (valid=%d age=%.2fs/%.2fs HES=%d "
+                               "control_usage_mode=%d motion_state=%d gait=%d/%d), "
+                               "sending zero speed command",
+                               status.valid, status_age, status_timeout_sec_, status.hes,
+                               status.control_usage_mode, status.motion_state,
+                               status.gait, gait_on_start_);
         }
         sendSpeedCommand(0.0, 0.0, 0.0);
         return;

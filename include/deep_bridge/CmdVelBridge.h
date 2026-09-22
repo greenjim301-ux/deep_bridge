@@ -65,6 +65,10 @@ private:
         int control_usage_mode = -1;  // 使用模式：0常规 1导航 2辅助；安全闸门要求它等于 usage_mode_
         bool sleep = false;
         bool valid = false;
+        // 这份状态是什么时候收到的。**安全闸门必须看它**：valid 只说明"收到过"，
+        // 不说明"现在还收得到"。上报中断（网络抖动、robotserve 重启、DTLS 会话
+        // 重置、机器人改向别人上报）时，valid 会一直停在 true，闸门就退化成
+        // "机器人曾经说过安全"——而 HES / 使用模式 / 运动状态在那期间都可能变了。
         ros::Time stamp;
     };
 
@@ -80,6 +84,8 @@ private:
     void handleBasicStatus(const nlohmann::json& items);
     void handleAbnormalStatus(const nlohmann::json& items);
     void handleGenericResponse(int type, int command, const nlohmann::json& items);  // 指南 1.5
+    static std::string itemsKeys(const nlohmann::json& items);   // 认不出报文时打出来便于排查
+    static void warnIfUnexpectedType(const char* what, int type, bool type_matches_guide);
     bool waitForFreshBasicStatus(double timeout_sec, BasicStatus& out);
 
     // ---- 请求发送 ----
@@ -125,7 +131,10 @@ private:
     // 设成 false 并改成对应的明文端口。
     std::string server_ip_ = "10.21.33.103";
     int server_port_ = 30004;
-    bool use_dtls_ = true;
+    // 跟 config/deep_bridge.yaml 保持一致。两处不同步的话，同一个节点用 roslaunch
+    // 和直接 rosrun 会走不同的传输方式——这里失败是响的（握手超时后 main 直接退出），
+    // 但仍然是个"两个事实来源"。
+    bool use_dtls_ = false;
     std::string ca_file_;  // 空=只加密不校验服务端证书，见 UdpTransport.h 的说明
     double dtls_handshake_timeout_sec_ = 5.0;
     std::string cmd_vel_topic_ = "cmd_vel";
@@ -161,6 +170,9 @@ private:
 
     bool set_usage_mode_on_start_ = true;
     double status_wait_timeout_sec_ = 3.0;
+    // 状态上报的新鲜度上限：超过这么久没收到新的基础状态就当闸门关闭、下发全零。
+    // 指南 1.3.1.1 说 2Hz 上报，1.0s 已经留了一倍余量。
+    double status_timeout_sec_ = 1.0;
 };
 
 }  // namespace deep_bridge

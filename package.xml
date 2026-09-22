@@ -4,11 +4,14 @@
   <name>deep_bridge</name>
   <version>0.1.0</version>
   <description>
-    Bridges geometry_msgs/Twist cmd_vel to Deep Robotics Lynx M20's UDP/JSON body-monitoring
-    protocol (speed-command ASDU, Type=2 Command=25, navigation mode), with a safety watchdog
-    that stops the robot
-    when cmd_vel stops arriving or the robot's own status reports (hard e-stop, usage mode, motion
-    state) say it isn't safe to drive. The protocol is plain UDP with a 16-byte header + JSON ASDU
+    Bridges geometry_msgs/Twist cmd_vel to Deep Robotics Lynx M20S's UDP/JSON body-monitoring
+    protocol. The axis command is paired with the usage mode, selected by the usage_mode
+    parameter: regular mode sends the normalized axis command (Type 0x00100001,
+    Command 0x00100002, values are a fraction of maximum speed), navigation mode sends the real
+    axis command (Command 0x00110002, values are m/s and rad/s). A safety watchdog stops the robot
+    when cmd_vel stops arriving, when the robot's own status reports (hard e-stop, usage mode,
+    motion state, gait) say it isn't safe to drive, or when those reports themselves go stale.
+    Transport is UDP, plain or DTLS-encrypted (use_dtls), with a 16-byte header + JSON ASDU
     body, so this package implements the framing itself (see include/deep_bridge/UdpProtocol.h)
     instead of depending on a vendor SDK. JSON parsing uses a vendored single-header nlohmann/json
     (include/deep_bridge/json.hpp, MIT licensed) rather than adding a system package dependency.

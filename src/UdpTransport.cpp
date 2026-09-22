@@ -246,6 +246,12 @@ ssize_t UdpTransport::receive(uint8_t* buf, size_t len, double timeout_sec) {
     }
 
     if (!options_.use_dtls) {
+        // 先按调用方给的 timeout_sec 等，再去 recv。直接 recv 的话真正生效的是
+        // 套接字固定的 SO_RCVTIMEO（100ms），timeout_sec 这个参数等于白写——
+        // 调用方以为自己在按 0.2s 轮询，实际是 0.1s。
+        if (!waitReadable(timeout_sec)) {
+            return 0;
+        }
         const ssize_t n = ::recv(sock_fd_, buf, len, 0);
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             return 0;  // 超时，不是错误
