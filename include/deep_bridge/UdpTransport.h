@@ -53,6 +53,11 @@ private:
     void startDtls();
     bool waitReadable(double timeout_sec) const;  // poll()，不持锁
 
+    // SSL_read 返回值的统一判定：>0 原样给出，WANT_READ/WANT_WRITE 当成"这次没有
+    // 应用数据"(0)，其余打日志并返回 -1。两个 SSL_read 调用点共用，保证"传输层
+    // 自己打日志"这个契约在 DTLS 侧没有漏网分支。调用方需持有 ssl_mutex_。
+    ssize_t classifySslRead(int n);
+
     Options options_;
     int sock_fd_ = -1;
 

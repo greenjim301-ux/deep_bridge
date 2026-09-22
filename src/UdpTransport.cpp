@@ -24,8 +24,6 @@ namespace {
 // 非应用数据记录（比如握手重传）而等不到后续报文时，最长会把发送方堵多久。
 constexpr int kSocketRecvTimeoutMs = 100;
 
-// 把 OpenSSL 错误队列里的内容全部取出来拼成一行，便于直接看出握手失败的原因
-// （证书校验失败、对端要求客户端证书、根本没开加密等等各有不同的错误码）。
 bool MakeSockAddr(const std::string& ip, int port, struct sockaddr_in& out) {
     std::memset(&out, 0, sizeof(out));
     out.sin_family = AF_INET;
@@ -33,6 +31,8 @@ bool MakeSockAddr(const std::string& ip, int port, struct sockaddr_in& out) {
     return ::inet_pton(AF_INET, ip.c_str(), &out.sin_addr) > 0;
 }
 
+// 把 OpenSSL 错误队列里的内容全部取出来拼成一行，便于直接看出握手失败的原因
+// （证书校验失败、对端要求客户端证书、根本没开加密等等各有不同的错误码）。
 std::string DrainOpenSslErrors() {
     std::string out;
     unsigned long err = 0;
@@ -224,7 +224,19 @@ bool UdpTransport::send(const uint8_t* data, size_t len) {
 
     if (!options_.use_dtls) {
         const ssize_t sent = ::send(sock_fd_, data, len, 0);
-        return sent >= 0 && static_cast<size_t>(sent) == len;
+        if (sent < 0) {
+            // 紧跟系统调用把 errno 抓下来再用。ROS_*_THROTTLE 展开后是先
+            // `::ros::Time::now()` 再求值格式参数（console.h:462），中间要是哪天
+            // 插进一个会设 errno 的调用，strerror(errno) 报的就是别人的错误码。
+            const int err = errno;
+            // 跟 DTLS 分支一样把原因打出来。**最常见的就是 ECONNREFUSED**：
+            // connect 过的 UDP 套接字会把对端回来的 ICMP port unreachable 变成
+            // 这个错误，也就是"机器人没开机"或"端口配错了"。不打的话调用方只能
+            // 报一句没有原因的 send failed，人还得去猜。
+            ROS_WARN_THROTTLE(5.0, "[deep_bridge] send() failed: %s", std::strerror(err));
+            return false;
+        }
+        return static_cast<size_t>(sent) == len;
     }
 
     std::lock_guard<std::mutex> lock(ssl_mutex_);
@@ -253,8 +265,18 @@ ssize_t UdpTransport::receive(uint8_t* buf, size_t len, double timeout_sec) {
             return 0;
         }
         const ssize_t n = ::recv(sock_fd_, buf, len, 0);
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            return 0;  // 超时，不是错误
+        if (n < 0) {
+            const int err = errno;   // 紧跟系统调用抓住，理由见 send() 里那段
+            if (err == EAGAIN || err == EWOULDBLOCK) {
+                return 0;  // 超时，不是错误
+            }
+            // 其余错误必须打出来 —— receiveLoop 的注释说"<0 由 UdpTransport 自己
+            // 打日志"，DTLS 分支确实这么做了，明文这边原先直接 return n 就把它咽了。
+            // 而这里最常见的恰恰是 ECONNREFUSED（对端 ICMP port unreachable，
+            // 即机器人没开机或端口配错），咽掉之后唯一的症状是每 5 秒一条
+            // "not safe to drive (valid=0 ...)"，完全指不到网络上去。
+            ROS_WARN_THROTTLE(5.0, "[deep_bridge] recv() failed: %s", std::strerror(err));
+            return -1;
         }
         return n;
     }
@@ -263,8 +285,7 @@ ssize_t UdpTransport::receive(uint8_t* buf, size_t len, double timeout_sec) {
     {
         std::lock_guard<std::mutex> lock(ssl_mutex_);
         if (ssl_ != nullptr && SSL_pending(ssl_) > 0) {
-            const int n = SSL_read(ssl_, buf, static_cast<int>(len));
-            return n > 0 ? n : -1;
+            return classifySslRead(SSL_read(ssl_, buf, static_cast<int>(len)));
         }
     }
 
@@ -277,13 +298,19 @@ ssize_t UdpTransport::receive(uint8_t* buf, size_t len, double timeout_sec) {
     if (ssl_ == nullptr) {
         return -1;
     }
-    const int n = SSL_read(ssl_, buf, static_cast<int>(len));
+    return classifySslRead(SSL_read(ssl_, buf, static_cast<int>(len)));
+}
+
+ssize_t UdpTransport::classifySslRead(int n) {
+    // 两个 SSL_read 调用点共用这一份判定，免得像之前那样 SSL_pending 那条快路径
+    // 自己写一句 `return n > 0 ? n : -1` 就把负返回悄悄咽掉 —— 那是"传输层自己
+    // 打日志"这个契约在 DTLS 侧唯一漏掉的分支。调用方需持有 ssl_mutex_。
     if (n > 0) {
         return n;
     }
     const int err = SSL_get_error(ssl_, n);
     if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
-        // 刚才 poll 到的是握手重传之类的非应用数据记录，不是应用报文
+        // 读到的是握手重传之类的非应用数据记录，不是错误，也不是应用报文
         return 0;
     }
     ROS_WARN_THROTTLE(5.0, "[deep_bridge] SSL_read failed (SSL_get_error=%d): %s", err,
