@@ -230,8 +230,8 @@ void CmdVelBridge::handleAsdu(const std::string& asdu_json) {
 
     // 目前只处理这个桥接节点安全运行需要的三类报文：基础状态（控制闸门/启动回读）、
     // 异常状态（日志可见性），以及指南 1.5 的通用接口调用状态响应（请求是否被接受）。
-    // 运控状态(1.3.1.2)、设备状态(1.3.1.3)、巡检类(1.4)指南里都有定义，暂不需要，
-    // 按需在这里加分支即可。
+    // 运控状态(1.3.1.2)本体会主动上报，认出来但不解析；设备状态(1.3.1.3)、巡检类(1.4)
+    // 指南里也有定义，暂不需要，按需在这里加分支即可。
     // **按内容分派，不按 Type 分派。** ASDU 自己就能认出来：基础状态带
     // Items.BasicStatus，异常状态带 Items.ErrorList，通用响应(指南 1.5)带
     // Items.ErrorCode。而 Type 的取值不可靠——实测本体上报用的高半字是 0x0030，
@@ -244,6 +244,9 @@ void CmdVelBridge::handleAsdu(const std::string& asdu_json) {
     } else if (items.contains("ErrorList")) {
         warnIfUnexpectedType("ErrorList", type, protocol::msg::isAbnormalStatusType(type));
         handleAbnormalStatus(items);
+    } else if (items.contains("MotionStatus")) {
+        // 运控状态上报(1.3.1.2)，实测 Type=0x00300001、Items 带 MotionStatus/MotorStatus。
+        // 暂不需要，先不解析；单独认出来只是为了不落进下面"认不出来"的告警。
     } else if (items.contains("ErrorCode")) {
         handleGenericResponse(type, command, items);
     } else {
@@ -374,8 +377,8 @@ void CmdVelBridge::handleAbnormalStatus(const nlohmann::json& items) {
             ROS_INFO_THROTTLE(2.0, "[deep_bridge] robot error cleared: 0x%04X %s [%s]", code, name.c_str(),
                                resources.c_str());
         } else {
-            // ROS_WARN_THROTTLE(2.0, "[deep_bridge] robot reported error 0x%04X %s severity=%d parts=[%s]", code,
-            //                   name.c_str(), severity, resources.c_str());
+            ROS_WARN_THROTTLE(10.0, "[deep_bridge] robot reported error 0x%04X %s severity=%d parts=[%s]", code,
+                               name.c_str(), severity, resources.c_str());
         }
     }
 }
