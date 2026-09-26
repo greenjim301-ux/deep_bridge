@@ -298,7 +298,7 @@ void CmdVelBridge::handleGenericResponse(int type, int command, const nlohmann::
 }
 
 void CmdVelBridge::handleBasicStatus(const nlohmann::json& items) {
-    ROS_INFO("[deep_bridge] received BasicStatus ASDU: %s", items.dump().c_str());
+    // ROS_INFO("[deep_bridge] received BasicStatus ASDU: %s", items.dump().c_str());
 
     if (!items.contains("BasicStatus")) {
         ROS_WARN_THROTTLE(5.0, "[deep_bridge] dropped BasicStatus ASDU without BasicStatus field at %s:%d", __FILE__, __LINE__);
@@ -374,8 +374,8 @@ void CmdVelBridge::handleAbnormalStatus(const nlohmann::json& items) {
             ROS_INFO_THROTTLE(2.0, "[deep_bridge] robot error cleared: 0x%04X %s [%s]", code, name.c_str(),
                                resources.c_str());
         } else {
-            ROS_WARN_THROTTLE(2.0, "[deep_bridge] robot reported error 0x%04X %s severity=%d parts=[%s]", code,
-                               name.c_str(), severity, resources.c_str());
+            // ROS_WARN_THROTTLE(2.0, "[deep_bridge] robot reported error 0x%04X %s severity=%d parts=[%s]", code,
+            //                   name.c_str(), severity, resources.c_str());
         }
     }
 }
