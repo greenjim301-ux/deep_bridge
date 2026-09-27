@@ -16,8 +16,6 @@ namespace {
 constexpr int kUsageModeRegular = 0;
 constexpr int kUsageModeNavigation = 1;
 
-constexpr int kGaitAgileStairs = 0x3003;       // 敏捷-楼梯
-constexpr double kAgileStairsYawGain = 4.0;    // 该步态下 yaw 实测 执行/指令 的倍数
 
 const char* UsageModeName(int mode) {
     return mode == kUsageModeNavigation ? "navigation" : "regular";
@@ -622,12 +620,11 @@ void CmdVelBridge::controlTimerCallback(const ros::TimerEvent&) {
 
     if (usage_mode_ == kUsageModeNavigation) {
         // 真实轴指令直接下发实际速度。
-        // 临时修正：实测 0x3003 敏捷-楼梯步态下 yaw 的执行速度是指令的 4 倍（只在
-        // 真实轴指令下观察过），这里按本体实时回报的步态除回去。放在限幅之后，这样
-        // max_vyaw 限的仍是实际角速度。正式方案是按步态、按轴的增益表，并用标定
-        // 脚本把比例量准。
-        const double yaw_out = status.gait == kGaitAgileStairs ? vyaw_eff / kAgileStairsYawGain : vyaw_eff;
-        sendSpeedCommand(vx_eff, vy_eff, yaw_out);
+        // 2026-09-27：取消 7b8084f 的"0x3003 下 yaw / 4"临时修正，yaw 原样下发。
+        // （那个 4x 是拿 odom 量出来的执行/指令比；而这段 odom 的偏航率本身有大量
+        //  物理上不可能的跳变，用它标定增益不可靠。正式方案仍是按步态、按轴的标定
+        //  增益表，而不是这里临时除一个常数。）
+        sendSpeedCommand(vx_eff, vy_eff, vyaw_eff);
     } else {
         // 归一化轴指令要的是比例不是速度，再除以满量程换算
         sendSpeedCommand(ToRatio(vx_eff, full_scale_vx_), ToRatio(vy_eff, full_scale_vy_),
