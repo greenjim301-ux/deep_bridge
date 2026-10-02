@@ -32,6 +32,7 @@
 #include <thread>
 
 #include <geometry_msgs/Twist.h>
+#include <geometry_msgs/TwistStamped.h>
 #include <ros/ros.h>
 
 #include "deep_bridge/UdpTransport.h"
@@ -82,6 +83,7 @@ private:
                             // 收不到持续心跳而停止上报状态，导致 waitForFreshBasicStatus 超时）
     void handleAsdu(const std::string& asdu_json);
     void handleBasicStatus(const nlohmann::json& items);
+    void handleMotionStatus(const nlohmann::json& items);  // 指南 1.3.1.2，10Hz，只转发机体速度
     void handleAbnormalStatus(const nlohmann::json& items);
     void handleGenericResponse(int type, int command, const nlohmann::json& items);  // 指南 1.5
     static std::string itemsKeys(const nlohmann::json& items);   // 认不出报文时打出来便于排查
@@ -122,6 +124,7 @@ private:
     ros::Time last_cmd_time_;
     bool have_cmd_ = false;
 
+    ros::Publisher motion_status_pub_;  // ~motion_status：本体上报的实测机体速度
     ros::Subscriber cmd_vel_sub_;
     ros::Timer control_timer_;
 

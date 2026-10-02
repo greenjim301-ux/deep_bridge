@@ -81,6 +81,9 @@ CmdVelBridge::CmdVelBridge(ros::NodeHandle& nh, ros::NodeHandle& pnh) {
         usage_mode_ = kUsageModeRegular;
     }
 
+    // 接收线程一起来就可能收到运控状态上报，发布者要先建好
+    motion_status_pub_ = pnh.advertise<geometry_msgs::TwistStamped>("motion_status", 20);
+
     openTransport();
 
     running_ = true;
@@ -228,7 +231,7 @@ void CmdVelBridge::handleAsdu(const std::string& asdu_json) {
 
     // 目前只处理这个桥接节点安全运行需要的三类报文：基础状态（控制闸门/启动回读）、
     // 异常状态（日志可见性），以及指南 1.5 的通用接口调用状态响应（请求是否被接受）。
-    // 运控状态(1.3.1.2)本体会主动上报，认出来但不解析；设备状态(1.3.1.3)、巡检类(1.4)
+    // 运控状态(1.3.1.2)只把机体速度转发成话题，不参与控制；设备状态(1.3.1.3)、巡检类(1.4)
     // 指南里也有定义，暂不需要，按需在这里加分支即可。
     // **按内容分派，不按 Type 分派。** ASDU 自己就能认出来：基础状态带
     // Items.BasicStatus，异常状态带 Items.ErrorList，通用响应(指南 1.5)带
@@ -244,7 +247,7 @@ void CmdVelBridge::handleAsdu(const std::string& asdu_json) {
         handleAbnormalStatus(items);
     } else if (items.contains("MotionStatus")) {
         // 运控状态上报(1.3.1.2)，实测 Type=0x00300001、Items 带 MotionStatus/MotorStatus。
-        // 暂不需要，先不解析；单独认出来只是为了不落进下面"认不出来"的告警。
+        handleMotionStatus(items);
     } else if (items.contains("ErrorCode")) {
         handleGenericResponse(type, command, items);
     } else {
@@ -328,6 +331,27 @@ void CmdVelBridge::handleBasicStatus(const nlohmann::json& items) {
 
     std::lock_guard<std::mutex> lock(status_mutex_);
     last_basic_status_ = status;
+}
+
+void CmdVelBridge::handleMotionStatus(const nlohmann::json& items) {
+    // 只转发、不参与任何控制判断：给定位侧当实测机体速度用（hand_lio 的
+    // pose_fusion_shadow_node）。指南 1.3.1.2 只写了 LinearX/LinearY 是"当前 X/Y 方向
+    // 线速度 (m/s)"、Body.OmegaZ 是"身体 Z 方向角速度 (rad/s)"，没说坐标系和符号，
+    // 这里原样转发，口径由下游录包对比确认。
+    geometry_msgs::TwistStamped out;
+    try {
+        const auto& ms = items.at("MotionStatus");
+        out.twist.linear.x = ms.at("LinearX").get<double>();
+        out.twist.linear.y = ms.at("LinearY").get<double>();
+        out.twist.angular.z = ms.at("Body").at("OmegaZ").get<double>();
+    } catch (const std::exception& e) {
+        ROS_WARN_THROTTLE(5.0, "[deep_bridge] failed to read MotionStatus fields at %s:%d: %s | body=%s", __FILE__,
+                           __LINE__, e.what(), items.dump().c_str());
+        return;
+    }
+    // 报文里的 Time 只到秒，10Hz 的上报用不上，按收到的时刻盖戳
+    out.header.stamp = ros::Time::now();
+    motion_status_pub_.publish(out);
 }
 
 void CmdVelBridge::handleAbnormalStatus(const nlohmann::json& items) {
