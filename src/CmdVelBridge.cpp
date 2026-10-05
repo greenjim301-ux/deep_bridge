@@ -234,8 +234,8 @@ void CmdVelBridge::handleAsdu(const std::string& asdu_json) {
 
     // 目前只处理这个桥接节点安全运行需要的三类报文：基础状态（控制闸门/启动回读）、
     // 异常状态（日志可见性），以及指南 1.5 的通用接口调用状态响应（请求是否被接受）。
-    // 运控状态(1.3.1.2)只把机体速度转发成话题，不参与控制；设备状态(1.3.1.3)只解析保存；
-    // 巡检类(1.4)指南里也有定义，暂不需要，按需在这里加分支即可。
+    // 运控状态(1.3.1.2)只把机体速度转发成话题，不参与控制；设备状态(1.3.1.3)和定位/导航
+    // 状态(1.4.2/1.4.4 的字段，实测是主动上报)只解析保存；其余巡检类(1.4)暂不需要。
     // **按内容分派，不按 Type 分派。** ASDU 自己就能认出来：基础状态带
     // Items.BasicStatus，异常状态带 Items.ErrorList，通用响应(指南 1.5)带
     // Items.ErrorCode。而 Type 的取值不可靠——实测本体上报用的高半字是 0x0030，
@@ -256,6 +256,11 @@ void CmdVelBridge::handleAsdu(const std::string& asdu_json) {
         // 所以更不能按 Type 分派）、Items 带 BatteryList/BatteryStatus/CPU/DevEnable/
         // DeviceTemperature/GPS。
         handleDeviceStatus(items);
+    } else if (items.contains("LocationStatus") || items.contains("NavStatus")) {
+        // 定位/导航状态上报，实测 Type=0x00100003、约 2Hz，Items 带 LocationStatus/NavStatus 两组。
+        // 指南没把它列为主动上报，只在 1.4.2/1.4.4 写了"请求-响应"形式（字段是平铺的，
+        // 也比实测少）。
+        handleLocationNavStatus(items);
     } else if (items.contains("ErrorCode")) {
         handleGenericResponse(type, command, items);
     } else {
@@ -372,21 +377,27 @@ void CmdVelBridge::handleMotionStatus(const nlohmann::json& items) {
     motion_status_pub_.publish(out);
 }
 
+bool CmdVelBridge::parseStatusGroup(const char* report, const nlohmann::json& items, const char* name,
+                                    const std::function<void(const nlohmann::json&)>& parse) {
+    // 状态上报一组一组解析，哪组不对只丢哪组：这些状态纯展示，不该因为固件跟指南差一个
+    // 字段就整份丢掉。各种上报共用这一处告警节流（30 秒一条），消息里带上报名和组名。
+    if (!items.contains(name)) {
+        return false;
+    }
+    try {
+        parse(items.at(name));
+        return true;
+    } catch (const std::exception& e) {
+        ROS_WARN_THROTTLE(30.0, "[deep_bridge] failed to read %s.%s at %s:%d: %s | body=%s", report, name, __FILE__,
+                           __LINE__, e.what(), items.at(name).dump().c_str());
+        return false;
+    }
+}
+
 void CmdVelBridge::handleDeviceStatus(const nlohmann::json& items) {
-    // 一组一组解析，哪组不对只丢哪组：这份状态纯展示，不该因为固件跟指南差一个字段就整份丢掉。
     DeviceStatus status;
     auto group = [&](const char* name, const std::function<void(const nlohmann::json&)>& parse) {
-        if (!items.contains(name)) {
-            return false;
-        }
-        try {
-            parse(items.at(name));
-            return true;
-        } catch (const std::exception& e) {
-            ROS_WARN_THROTTLE(30.0, "[deep_bridge] failed to read DeviceStatus.%s at %s:%d: %s | body=%s", name,
-                               __FILE__, __LINE__, e.what(), items.at(name).dump().c_str());
-            return false;
-        }
+        return parseStatusGroup("DeviceStatus", items, name, parse);
     };
     auto maxOf = [](const nlohmann::json& arr) {
         double m = 0.0;
@@ -444,6 +455,44 @@ void CmdVelBridge::handleDeviceStatus(const nlohmann::json& items) {
 
     std::lock_guard<std::mutex> lock(device_status_mutex_);
     last_device_status_ = status;
+}
+
+void CmdVelBridge::handleLocationNavStatus(const nlohmann::json& items) {
+    LocationNavStatus status;
+    auto group = [&](const char* name, const std::function<void(const nlohmann::json&)>& parse) {
+        return parseStatusGroup("LocationNavStatus", items, name, parse);
+    };
+
+    status.has_location = group("LocationStatus", [&](const nlohmann::json& l) {
+        status.location = l.at("Location").get<int>();
+        status.relocation = l.at("Relocation").get<int>();
+        status.confidence = l.at("Confidence").get<double>();
+        status.pos_x = l.at("PosX").get<double>();
+        status.pos_y = l.at("PosY").get<double>();
+        status.pos_z = l.at("PosZ").get<double>();
+        status.roll = l.at("Roll").get<double>();
+        status.pitch = l.at("Pitch").get<double>();
+        status.yaw = l.at("Yaw").get<double>();
+    });
+    status.has_nav = group("NavStatus", [&](const nlohmann::json& n) {
+        status.nav_value = n.at("Value").get<int>();
+        status.nav_status = n.at("Status").get<int>();
+        status.nav_error_code = n.at("ErrorCode").get<int>();
+        status.nav_loop_cnt = n.at("LoopCnt").get<int>();
+        status.nav_remaining_cnt = n.at("RemainingCnt").get<int>();
+        status.nav_name = n.at("Name").get<std::string>();
+    });
+    status.valid = true;
+    status.stamp = ros::Time::now();
+
+    ROS_DEBUG_THROTTLE(10.0,
+                       "[deep_bridge] location/nav status: location=%d relocation=%d confidence=%.2f "
+                       "pos=[%.2f %.2f %.2f] yaw=%.2f | nav status=%d value=%d error=0x%04X",
+                       status.location, status.relocation, status.confidence, status.pos_x, status.pos_y,
+                       status.pos_z, status.yaw, status.nav_status, status.nav_value, status.nav_error_code);
+
+    std::lock_guard<std::mutex> lock(location_nav_status_mutex_);
+    last_location_nav_status_ = status;
 }
 
 void CmdVelBridge::handleAbnormalStatus(const nlohmann::json& items) {

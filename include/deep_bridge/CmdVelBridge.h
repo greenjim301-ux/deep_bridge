@@ -26,6 +26,7 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -104,6 +105,33 @@ private:
         ros::Time stamp;
     };
 
+    // 机器人主动上报的定位/导航状态（实测 Type=0x00100003，约 2Hz）。指南只在 1.4.2 /
+    // 1.4.4 写了"请求-响应"形式，字段是平铺的；实测是 LocationStatus/NavStatus 两组嵌套，
+    // 字段也更多。这是本体自带定位/导航的状态，我们的导航不用它（定位走 grodom），
+    // 只解析保存，不参与控制、不发话题。本体导航没跑时 Location=1（丢失）、其余全 0。
+    struct LocationNavStatus {
+        bool has_location = false;  // LocationStatus
+        int location = -1;          // 0 定位正常 / 1 定位丢失（1.4.2）
+        int relocation = -1;        // 指南没写，原样保存
+        double confidence = 0.0;    // 指南没写，原样保存
+        double pos_x = 0.0;         // 地图坐标系 m
+        double pos_y = 0.0;
+        double pos_z = 0.0;
+        double roll = 0.0;          // rad
+        double pitch = 0.0;
+        double yaw = 0.0;
+        bool has_nav = false;       // NavStatus（字段同 1.4.4 导航任务执行状态）
+        int nav_value = -1;         // 导航任务目标点编号
+        int nav_status = -1;        // 0 空闲 / 1 退出充电桩中 / 2 导航预处理 / 3 导航中 / 4 导航完成 /
+                                    // 5 进入充电桩中 / 0xff 暂停中
+        int nav_error_code = -1;    // 见 1.4.4 导航错误码表
+        int nav_loop_cnt = -1;      // 指南没写，原样保存
+        int nav_remaining_cnt = -1; // 指南没写，原样保存
+        std::string nav_name;       // 指南没写，原样保存
+        bool valid = false;
+        ros::Time stamp;
+    };
+
     // ---- 建立连接 / 后台接收 / 后台心跳 ----
     void openTransport();
     void receiveLoop();  // 后台线程：阻塞收（带超时以便退出），解析后分发给 handleAsdu
@@ -116,6 +144,10 @@ private:
     void handleBasicStatus(const nlohmann::json& items);
     void handleMotionStatus(const nlohmann::json& items);  // 指南 1.3.1.2，10Hz，只转发机体速度
     void handleDeviceStatus(const nlohmann::json& items);  // 指南 1.3.1.3，2Hz，只解析保存
+    void handleLocationNavStatus(const nlohmann::json& items);  // 实测 0x00100003，约 2Hz，只解析保存
+    // 状态上报里一组字段的解析：组不存在返回 false，解析失败节流告警后返回 false
+    static bool parseStatusGroup(const char* report, const nlohmann::json& items, const char* name,
+                                 const std::function<void(const nlohmann::json&)>& parse);
     void handleAbnormalStatus(const nlohmann::json& items);
     void handleGenericResponse(int type, int command, const nlohmann::json& items);  // 指南 1.5
     static std::string itemsKeys(const nlohmann::json& items);   // 认不出报文时打出来便于排查
@@ -148,6 +180,9 @@ private:
 
     std::mutex device_status_mutex_;
     DeviceStatus last_device_status_;
+
+    std::mutex location_nav_status_mutex_;
+    LocationNavStatus last_location_nav_status_;
 
     std::mutex msg_id_mutex_;
     uint16_t next_msg_id_ = 0;  // 指南 1.1.5：从 0 递增，65535 后回绕到 0
