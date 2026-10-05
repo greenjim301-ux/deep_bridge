@@ -83,6 +83,7 @@ CmdVelBridge::CmdVelBridge(ros::NodeHandle& nh, ros::NodeHandle& pnh) {
 
     // 接收线程一起来就可能收到运控状态上报，发布者要先建好
     motion_status_pub_ = pnh.advertise<geometry_msgs::TwistStamped>("motion_status", 20);
+    motion_status_raw_pub_ = pnh.advertise<std_msgs::String>("motion_status_raw", 20);
 
     openTransport();
 
@@ -336,14 +337,24 @@ void CmdVelBridge::handleBasicStatus(const nlohmann::json& items) {
 void CmdVelBridge::handleMotionStatus(const nlohmann::json& items) {
     // 只转发、不参与任何控制判断：给定位侧当实测机体速度用（hand_lio 的
     // pose_fusion_shadow_node）。指南 1.3.1.2 只写了 LinearX/LinearY 是"当前 X/Y 方向
-    // 线速度 (m/s)"、Body.OmegaZ 是"身体 Z 方向角速度 (rad/s)"，没说坐标系和符号，
-    // 这里原样转发，口径由下游录包对比确认。
+    // 线速度 (m/s)"、Body.OmegaZ 是"身体 Z 方向角速度 (rad/s)"，没说坐标系和符号。
+    // 实测固件把 OmegaZ 直接放在 MotionStatus 下；兼容指南的 Body.OmegaZ 格式。
+    // 这里原样转发，口径由下游录包对比确认；AngularZ 是另一字段，不代替 OmegaZ。
+    //
+    // 字段含义还没定（OmegaZ 看着是陀螺原始读数、AngularZ 可能是估计器输出），
+    // 所以整份 Items（MotionStatus + MotorStatus）原文另发一份到 ~motion_status_raw，
+    // 录包后离线对比，不用为了换字段再改代码重录。放在解析之前：字段对不上时原文照发。
+    std_msgs::String raw;
+    raw.data = items.dump();
+    motion_status_raw_pub_.publish(raw);
+
     geometry_msgs::TwistStamped out;
     try {
         const auto& ms = items.at("MotionStatus");
         out.twist.linear.x = ms.at("LinearX").get<double>();
         out.twist.linear.y = ms.at("LinearY").get<double>();
-        out.twist.angular.z = ms.at("Body").at("OmegaZ").get<double>();
+        out.twist.angular.z = ms.contains("OmegaZ") ? ms.at("OmegaZ").get<double>()
+                                                   : ms.at("Body").at("OmegaZ").get<double>();
     } catch (const std::exception& e) {
         ROS_WARN_THROTTLE(5.0, "[deep_bridge] failed to read MotionStatus fields at %s:%d: %s | body=%s", __FILE__,
                            __LINE__, e.what(), items.dump().c_str());

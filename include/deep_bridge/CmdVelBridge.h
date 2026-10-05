@@ -33,6 +33,7 @@
 
 #include <geometry_msgs/Twist.h>
 #include <geometry_msgs/TwistStamped.h>
+#include <std_msgs/String.h>
 #include <ros/ros.h>
 
 #include "deep_bridge/UdpTransport.h"
@@ -125,6 +126,7 @@ private:
     bool have_cmd_ = false;
 
     ros::Publisher motion_status_pub_;  // ~motion_status：本体上报的实测机体速度
+    ros::Publisher motion_status_raw_pub_;  // ~motion_status_raw：运控状态上报的 Items 原文（JSON）
     ros::Subscriber cmd_vel_sub_;
     ros::Timer control_timer_;
 

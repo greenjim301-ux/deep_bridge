@@ -12,6 +12,7 @@ set(CMAKE_CXX_FLAGS "-O2 ${CMAKE_CXX_FLAGS}")
 find_package(catkin REQUIRED COMPONENTS
         roscpp
         geometry_msgs
+        std_msgs
 )
 
 # 后台接收线程用 std::thread，显式链接 pthread
@@ -22,7 +23,7 @@ find_package(OpenSSL REQUIRED)
 
 catkin_package(
         INCLUDE_DIRS include
-        CATKIN_DEPENDS roscpp geometry_msgs
+        CATKIN_DEPENDS roscpp geometry_msgs std_msgs
 )
 
 include_directories(
