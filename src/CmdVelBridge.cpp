@@ -1,8 +1,10 @@
 #include "deep_bridge/CmdVelBridge.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <functional>
 #include <stdexcept>
 
 #include "deep_bridge/UdpProtocol.h"
@@ -232,8 +234,8 @@ void CmdVelBridge::handleAsdu(const std::string& asdu_json) {
 
     // 目前只处理这个桥接节点安全运行需要的三类报文：基础状态（控制闸门/启动回读）、
     // 异常状态（日志可见性），以及指南 1.5 的通用接口调用状态响应（请求是否被接受）。
-    // 运控状态(1.3.1.2)只把机体速度转发成话题，不参与控制；设备状态(1.3.1.3)、巡检类(1.4)
-    // 指南里也有定义，暂不需要，按需在这里加分支即可。
+    // 运控状态(1.3.1.2)只把机体速度转发成话题，不参与控制；设备状态(1.3.1.3)只解析保存；
+    // 巡检类(1.4)指南里也有定义，暂不需要，按需在这里加分支即可。
     // **按内容分派，不按 Type 分派。** ASDU 自己就能认出来：基础状态带
     // Items.BasicStatus，异常状态带 Items.ErrorList，通用响应(指南 1.5)带
     // Items.ErrorCode。而 Type 的取值不可靠——实测本体上报用的高半字是 0x0030，
@@ -249,6 +251,11 @@ void CmdVelBridge::handleAsdu(const std::string& asdu_json) {
     } else if (items.contains("MotionStatus")) {
         // 运控状态上报(1.3.1.2)，实测 Type=0x00300001、Items 带 MotionStatus/MotorStatus。
         handleMotionStatus(items);
+    } else if (items.contains("DeviceTemperature") || items.contains("BatteryList")) {
+        // 设备状态上报(1.3.1.3)，实测 Type=0x00100002（跟使用模式切换请求同一个 Type，
+        // 所以更不能按 Type 分派）、Items 带 BatteryList/BatteryStatus/CPU/DevEnable/
+        // DeviceTemperature/GPS。
+        handleDeviceStatus(items);
     } else if (items.contains("ErrorCode")) {
         handleGenericResponse(type, command, items);
     } else {
@@ -363,6 +370,80 @@ void CmdVelBridge::handleMotionStatus(const nlohmann::json& items) {
     // 报文里的 Time 只到秒，10Hz 的上报用不上，按收到的时刻盖戳
     out.header.stamp = ros::Time::now();
     motion_status_pub_.publish(out);
+}
+
+void CmdVelBridge::handleDeviceStatus(const nlohmann::json& items) {
+    // 一组一组解析，哪组不对只丢哪组：这份状态纯展示，不该因为固件跟指南差一个字段就整份丢掉。
+    DeviceStatus status;
+    auto group = [&](const char* name, const std::function<void(const nlohmann::json&)>& parse) {
+        if (!items.contains(name)) {
+            return false;
+        }
+        try {
+            parse(items.at(name));
+            return true;
+        } catch (const std::exception& e) {
+            ROS_WARN_THROTTLE(30.0, "[deep_bridge] failed to read DeviceStatus.%s at %s:%d: %s | body=%s", name,
+                               __FILE__, __LINE__, e.what(), items.at(name).dump().c_str());
+            return false;
+        }
+    };
+    auto maxOf = [](const nlohmann::json& arr) {
+        double m = 0.0;
+        bool first = true;
+        for (const auto& v : arr) {
+            const double x = v.get<double>();
+            m = first ? x : std::max(m, x);
+            first = false;
+        }
+        return m;
+    };
+
+    group("BatteryList", [&](const nlohmann::json& list) {
+        for (const auto& b : list) {
+            DeviceStatus::Battery battery;
+            battery.voltage = b.at("Voltage").get<double>();
+            battery.level = b.at("BatteryLevel").get<double>();
+            battery.temperature = b.at("battery_temperature").get<double>();
+            battery.charging = b.at("charge").get<bool>();
+            status.batteries.push_back(battery);
+        }
+    });
+    status.has_temperature = group("DeviceTemperature", [&](const nlohmann::json& t) {
+        status.motor_temp_max = maxOf(t.at("Motor"));
+        status.driver_temp_max = maxOf(t.at("Driver"));
+    });
+    status.has_dev_enable = group("DevEnable", [&](const nlohmann::json& d) {
+        status.lidar_enable = d.at("Lidar").get<int>();
+        status.video_enable = d.at("Video").get<int>();
+    });
+    group("CPU", [&](const nlohmann::json& cpu) {
+        for (auto it = cpu.begin(); it != cpu.end(); ++it) {
+            DeviceStatus::Soc soc;
+            soc.name = it.key();
+            soc.avg_util = it.value().at("AvgUtil").get<int>();
+            soc.package_temp = it.value().at("PackageTemp").get<int>();
+            status.cpus.push_back(soc);
+        }
+    });
+    status.valid = true;
+    status.stamp = ros::Time::now();
+
+    std::string batteries;
+    for (const auto& b : status.batteries) {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%s%.0f%% %.1fV %.0fC%s", batteries.empty() ? "" : ", ", b.level, b.voltage,
+                      b.temperature, b.charging ? " charging" : "");
+        batteries += buf;
+    }
+    ROS_DEBUG_THROTTLE(10.0,
+                       "[deep_bridge] device status: batteries [%s], motor/driver max %.0f/%.0fC, lidar=%d video=%d, "
+                       "%zu CPU groups",
+                       batteries.c_str(), status.motor_temp_max, status.driver_temp_max, status.lidar_enable,
+                       status.video_enable, status.cpus.size());
+
+    std::lock_guard<std::mutex> lock(device_status_mutex_);
+    last_device_status_ = status;
 }
 
 void CmdVelBridge::handleAbnormalStatus(const nlohmann::json& items) {

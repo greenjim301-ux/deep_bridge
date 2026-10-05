@@ -30,6 +30,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <geometry_msgs/Twist.h>
 #include <geometry_msgs/TwistStamped.h>
@@ -74,6 +75,35 @@ private:
         ros::Time stamp;
     };
 
+    // 机器人主动上报的"设备状态"（指南 1.3.1.3，2Hz）。只解析保存，目前不参与任何控制
+    // 判断、也不发话题。每一组都是可选的：实测固件跟指南对不上过（运控状态就是平铺的），
+    // 某一组缺失或类型不符只丢那一组，has_* 标记哪些组这次解析到了。
+    // 实测（2026-10-05 真机）还多带 BatteryStatus（空对象）、GPS 两组，不解析；DevEnable
+    // 实际有十来个字段，这里只取指南写的 Lidar/Video；CPU 只有 AOS、NOS 两台主机。
+    struct DeviceStatus {
+        struct Battery {
+            double voltage = 0.0;      // V
+            double level = 0.0;        // %，[0,100]
+            double temperature = 0.0;  // ℃
+            bool charging = false;
+        };
+        std::vector<Battery> batteries;  // BatteryList，实测 M20S 有两块（指南示例只有一块）
+        bool has_temperature = false;  // DeviceTemperature：16 个关节的电机/驱动器温度，这里只留最高值
+        double motor_temp_max = 0.0;   // ℃
+        double driver_temp_max = 0.0;  // ℃
+        bool has_dev_enable = false;   // DevEnable
+        int lidar_enable = -1;         // 0 关闭 / 1 开启 / 2 开启中
+        int video_enable = -1;         // 0 关闭 / 1 开启
+        struct Soc {
+            std::string name;          // AOS 运动主机 / NOS 导航主机 / GOS 通用主机
+            int avg_util = -1;         // %
+            int package_temp = -1;     // ℃
+        };
+        std::vector<Soc> cpus;         // CPU 组里解析到的主机
+        bool valid = false;
+        ros::Time stamp;
+    };
+
     // ---- 建立连接 / 后台接收 / 后台心跳 ----
     void openTransport();
     void receiveLoop();  // 后台线程：阻塞收（带超时以便退出），解析后分发给 handleAsdu
@@ -85,6 +115,7 @@ private:
     void handleAsdu(const std::string& asdu_json);
     void handleBasicStatus(const nlohmann::json& items);
     void handleMotionStatus(const nlohmann::json& items);  // 指南 1.3.1.2，10Hz，只转发机体速度
+    void handleDeviceStatus(const nlohmann::json& items);  // 指南 1.3.1.3，2Hz，只解析保存
     void handleAbnormalStatus(const nlohmann::json& items);
     void handleGenericResponse(int type, int command, const nlohmann::json& items);  // 指南 1.5
     static std::string itemsKeys(const nlohmann::json& items);   // 认不出报文时打出来便于排查
@@ -114,6 +145,9 @@ private:
 
     std::mutex status_mutex_;
     BasicStatus last_basic_status_;
+
+    std::mutex device_status_mutex_;
+    DeviceStatus last_device_status_;
 
     std::mutex msg_id_mutex_;
     uint16_t next_msg_id_ = 0;  // 指南 1.1.5：从 0 递增，65535 后回绕到 0
